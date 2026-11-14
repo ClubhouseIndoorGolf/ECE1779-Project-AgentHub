@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### 2026-11-14
+
+- **Live updates over SSE.** `GET /conversations/{id}/events` streams new messages, job status changes and proposal status changes for an owned conversation. `Last-Event-ID` replays messages after the given sequence, and each stream closes after five minutes so clients reconnect. The browser follows sends and approved continuations through pushed events, reconnects with backoff, and falls back to polling when no stream is live. The footer shows the connection state. No schema change. [Live updates guide](docs/LIVE_UPDATES.md)
+
 ### 2026-11-11
 
 - **Ticket lookup** (`d3b49fa`). Fixed mode can look up a simulated support ticket and check the linked order's refund eligibility. Ticket and order access are checked separately. Migration `0004_read_only_ticket_lookup` adds tickets, and `seed-demo-tickets` adds sample tickets and their orders.

@@ -126,3 +126,9 @@ class JobOut(BaseModel):
     last_error: str | None
     created_at: datetime
     finished_at: datetime | None
+
+
+# Stream job progress with its kind so clients can tell replies from approved continuations.
+# 推送任务进度时附带任务类型，便于客户端区分普通回复与批准后的恢复执行。
+class JobEventOut(JobOut):
+    kind: str

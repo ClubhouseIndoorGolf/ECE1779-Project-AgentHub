@@ -21,7 +21,7 @@ function response(data) {
 /** Create isolated page state and a controllable fetch transport for the real client script.
  * 为真实客户端脚本创建独立页面状态，以及可精确控制响应时序的模拟 fetch 传输。
  */
-function createClient(handler) {
+function createClient(handler, extraGlobals = {}) {
   const elements = new Map();
 
   /** Model only DOM operations used by the chat state machine, leaving layout to browsers.
@@ -114,8 +114,9 @@ function createClient(handler) {
     fetch: fetchClient,
     matchMedia: () => ({ matches: false, addEventListener() {} }),
     localStorage: { getItem() {}, setItem() {} },
-    AbortSignal, crypto: webcrypto, setTimeout, Date,
+    AbortSignal, crypto: webcrypto, setTimeout, clearTimeout, Date,
     btoa: value => Buffer.from(value, "binary").toString("base64"),
+    ...extraGlobals,
   });
   vm.runInContext(source, context);
 
@@ -363,4 +364,111 @@ test("switching chats clears old proposal controls before history loads", async 
   resolveHistory(response([{ seq: 1, role: "user", content: "New request" }]));
   await switching;
   assert.equal(client.element("messages").children[0].children[1].textContent, "New request");
+});
+
+// Live-update tests provide the browser streaming APIs that the default harness omits.
+// 实时更新测试额外提供默认测试环境未包含的浏览器流式接口。
+const streamingGlobals = { AbortController, TextDecoderStream };
+
+/** Build a controllable SSE response whose body errors when the request is aborted, like fetch.
+ * 构造可控的 SSE 响应；与真实 fetch 一样，请求被中止时响应体会报错。
+ */
+function sseResponse(signal) {
+  let controller;
+  const body = new ReadableStream({ start(c) { controller = c; } });
+  signal?.addEventListener("abort", () => {
+    try { controller.error(new DOMException("Aborted", "AbortError")); } catch { /* already closed */ }
+  });
+  const encoder = new TextEncoder();
+  return {
+    response: { ok: true, status: 200, body },
+    push: text => controller.enqueue(encoder.encode(text)),
+    close: () => controller.close(),
+  };
+}
+
+/** Wait until a condition holds, failing the test instead of hanging.
+ * 等待条件成立；超时则让测试失败而不是挂起。
+ */
+async function until(check, ms = 3000) {
+  const end = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > end) throw new Error("Timed out waiting for condition");
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+
+test("a pushed job event completes a send without polling the job", async () => {
+  let stream, jobPolls = 0, done = false;
+  const user = { seq: 1, role: "user", content: "Hi" };
+  const assistant = { seq: 2, role: "assistant", content: "Message received." };
+  const client = createClient(async (url, options) => {
+    if (url === "/conversations/chat-a/events") {
+      stream = sseResponse(options.signal);
+      return stream.response;
+    }
+    if (url.endsWith("/messages") && options.method === "POST") return response({ message_id: "m1", job_id: "job-1" });
+    if (url.includes("/messages?")) return response(done ? [user, assistant] : [user]);
+    if (url === "/conversations") return response([{ id: "chat-a", title: "Chat A" }]);
+    if (url === "/jobs/job-1") { jobPolls++; return response({ status: "QUEUED" }); }
+    throw new Error("Unexpected request: " + url);
+  }, streamingGlobals);
+  await client.run("authorization = 'Basic test'; openConversation({ id: 'chat-a', title: 'Chat A' })");
+  await until(() => stream);
+  stream.push('retry: 2000\n\nid: 0\nevent: ready\ndata: {"cursor":0}\n\n');
+  await until(() => client.run("streamLive()"));
+  assert.equal(client.element("connection-label").textContent, "Live updates");
+
+  const sending = client.send("Hi");
+  await new Promise(resolve => setTimeout(resolve, 50));
+  done = true;
+  // Split one frame across chunks to exercise buffering.
+  // 将一个事件帧拆成两段发送，以验证缓冲解析。
+  stream.push('event: job\ndata: {"id":"job-1","status":"SUCC');
+  stream.push('EEDED","last_error":null}\n\n');
+  await sending;
+  assert.equal(jobPolls, 0);
+  const rows = client.element("messages").children;
+  assert.equal(rows[rows.length - 1].children[1].textContent, "Message received.");
+  client.run("newChat()");
+  assert.equal(client.element("connection-label").textContent, "Local workspace");
+});
+
+test("a dropped stream reconnects with the last message sequence", async () => {
+  const attempts = [];
+  const client = createClient(async (url, options) => {
+    if (url === "/conversations/chat-a/events") {
+      const stream = sseResponse(options.signal);
+      attempts.push({ headers: options.headers, stream });
+      return stream.response;
+    }
+    if (url.includes("/messages?")) return response([]);
+    if (url === "/conversations") return response([]);
+    throw new Error("Unexpected request: " + url);
+  }, streamingGlobals);
+  await client.run("authorization = 'Basic test'; openConversation({ id: 'chat-a', title: 'Chat A' })");
+  await until(() => attempts.length === 1);
+  assert.equal(attempts[0].headers["Last-Event-ID"], undefined);
+  attempts[0].stream.push('id: 2\nevent: ready\ndata: {"cursor":2}\n\n: keepalive\n\n');
+  attempts[0].stream.push('id: 3\nevent: message\ndata: {"seq":3}\n\n');
+  await until(() => client.run("stream.lastSeq") === 3);
+  attempts[0].stream.close();
+  await until(() => client.element("connection-label").textContent === "Reconnecting…");
+  await until(() => attempts.length === 2);
+  assert.equal(attempts[1].headers["Last-Event-ID"], "3");
+  client.run("newChat()");
+});
+
+test("a refused stream falls back to polling without retrying", async () => {
+  let opens = 0;
+  const client = createClient(async url => {
+    if (url === "/conversations/chat-a/events") { opens++; return { ok: false, status: 404 }; }
+    if (url.includes("/messages?")) return response([]);
+    throw new Error("Unexpected request: " + url);
+  }, streamingGlobals);
+  await client.run("authorization = 'Basic test'; openConversation({ id: 'chat-a', title: 'Chat A' })");
+  await new Promise(resolve => setTimeout(resolve, 400));
+  assert.equal(opens, 1);
+  assert.equal(client.run("streamLive()"), false);
+  client.run("newChat()");
 });
