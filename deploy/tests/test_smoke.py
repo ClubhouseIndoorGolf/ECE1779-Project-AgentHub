@@ -1,3 +1,4 @@
+# 使用临时模拟 HTTP 服务验证 API 契约，无需访问实际部署。
 """Contract tests against an ephemeral mock HTTP server, never a deployment."""
 
 from contextlib import redirect_stdout, redirect_stderr

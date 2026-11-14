@@ -11,6 +11,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Reuse Backend CI so publication uses the runtime image that passed its tests.
+  # 复用后端 CI，确保发布的是通过测试的运行镜像。
   required-checks:
     uses: ./.github/workflows/ci.yml
     with:
@@ -30,6 +32,8 @@ jobs:
           python -m unittest discover -s deploy/tests -v
           python deploy/scripts/monitor.py --plan
       - name: Parse the Swarm stack using non-secret placeholders
+        # Validate stack syntax without accessing a Swarm or registry.
+        # 无需访问 Swarm 或镜像仓库即可验证 stack 配置语法。
         env:
           AGENTHUB_IMAGE: ghcr.io/example/agenthub/backend:validation
           POSTGRES_IMAGE: postgres:17-bookworm
@@ -42,6 +46,8 @@ jobs:
     needs: [required-checks, delivery-checks]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Grant package write access only to the publishing job.
+    # 仅向发布任务授予软件包写入权限。
     permissions:
       contents: read
       packages: write
@@ -51,6 +57,8 @@ jobs:
           name: runtime-image-${{ github.run_id }}
           path: ${{ runner.temp }}/runtime
       - name: Publish the exact runtime image that passed CI
+        # Pull by digest and compare image IDs before publishing deployment instructions.
+        # 按摘要拉取镜像并比对 ID，然后输出部署所需的镜像信息。
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash

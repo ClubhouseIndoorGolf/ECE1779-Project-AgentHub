@@ -1,3 +1,4 @@
+# 离线验证部署编排：所有 Docker 命令均由严格校验的模拟 CLI 处理。
 """Offline orchestration tests: every Docker command goes to a strict fake CLI."""
 
 import json
@@ -19,6 +20,7 @@ def bash_path(path):
 
 
 def fake_docker(args):
+    # 遇到未识别的命令时直接失败，避免调用真实 Docker daemon。
     """Fail on unknown commands rather than ever falling back to a real daemon."""
     sys.stdout.reconfigure(newline="\n")
     state_path = Path(os.environ["FAKE_STATE"])

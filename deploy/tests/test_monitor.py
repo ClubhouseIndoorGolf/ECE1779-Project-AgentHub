@@ -1,3 +1,4 @@
+# 只读监控检查的离线测试。
 """Offline tests for read-only monitoring checks."""
 
 import io
@@ -116,6 +117,7 @@ class MonitorTests(unittest.TestCase):
     def test_one_node_local_validation_mode(self):
         fixture = DockerFixture(one_node=True)
         # In local validation all replicas are placed on the manager.
+        # 本地验证中，所有副本都运行在管理节点上。
         def local_run(args, timeout):
             output = fixture.run(args, timeout)
             if args[:2] == ["service", "ps"]:

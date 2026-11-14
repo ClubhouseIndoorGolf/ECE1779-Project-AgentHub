@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Shared checks for the two-node deployment scripts. No actions run on source.
+# 两节点部署脚本共用的检查函数。加载此文件时只定义函数。
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
@@ -59,6 +60,7 @@ configure() {
   SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
   STACK_FILE="$SCRIPT_DIR/../swarm/stack.yaml"
   # Never print rendered configuration or feed it through interpolation twice.
+  # 隐藏解析后的配置，避免将解析结果再次传入部署命令并重复插值。
   docker stack config -c "$STACK_FILE" >/dev/null || fail 'Stack configuration is invalid'
 }
 
@@ -70,6 +72,8 @@ on_node() {
   else
     [[ $node == "$WORKER_ID" && -n ${WORKER_SSH:-} ]] || fail 'Unknown remote node'
     printf -v quoted '%q ' "$@"
+    # Preserve argument boundaries when the remote Bash shell parses the command.
+    # 远端 Bash 解析命令时保留各个参数的边界。
     ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 "$WORKER_SSH" "$quoted"
   fi
 }
@@ -115,6 +119,8 @@ wait_healthy() {
       health=$(on_node "$node" docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container" 2>/dev/null) || health=unavailable
       [[ $health != healthy ]] || count=$((count + 1))
     done <<< "$ids"
+    # Count only healthy tasks that Swarm still wants running.
+    # 仅统计 Swarm 期望继续运行且健康的任务。
     if (( count == expected && total == expected )) && [[ $update != updating ]]; then
       note "$service: $count healthy tasks"
       return
@@ -170,6 +176,7 @@ inspect_cluster() {
   fi
   docker secret inspect "$DB_PASSWORD_SECRET" "$BOOTSTRAP_PASSWORD_SECRET" >/dev/null || fail 'Required Swarm secret is missing'
   # These are read-only checks. The operator must mount storage and pull images first.
+  # 这些检查只读。操作者须先挂载存储并拉取镜像。
   on_node "$DB_NODE" bash -s -- "$POSTGRES_DATA_PATH" "$STORAGE_MODE" "${POSTGRES_VOLUME_MOUNT:-}" "${POSTGRES_VOLUME_UUID:-}" <<'STORAGE' || fail 'Database storage check failed on the labeled node'
 set -euo pipefail
 data=$1; mode=$2; mount=$3; uuid=$4
@@ -216,6 +223,8 @@ check_existing() {
     [[ $setup == 0 ]] && stopped "${STACK}_setup" || fail 'Existing setup is armed or unfinished; inspect it and explicitly return it to zero before retrying'
   fi
   for service in $services; do
+    # Compare the existing service spec with the requested storage and secret settings.
+    # 将现有服务定义与本次部署要求的存储及密钥配置进行比对。
     spec_data=$(docker service inspect --format '{{json .Spec}}' "$service") || fail 'Cannot inspect existing service'
     printf '%s' "$spec_data" | python3 -c '
 import json,os,sys
@@ -249,6 +258,7 @@ elif name in [os.environ["STACK"]+"_"+n for n in ("api","worker","setup")]:
 ' || fail 'Existing services conflict with this deployment; no mutation performed'
   done
   # Include standalone/stopped containers: a later restart must not share PGDATA.
+  # 同时检查独立容器及已停止的容器，防止它们重启后共用 PGDATA。
   local containers container_json
   containers=$(on_node "$DB_NODE" docker ps -aq) || fail 'Cannot inspect database-node containers'
   for service in $containers; do

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 通过公开 HTTP 接口验证 API 契约，无需导入后端或数据库模块。
 """Verify the public API contract without importing backend/database internals."""
 
 import argparse
@@ -16,6 +17,7 @@ from uuid import UUID, uuid4
 
 
 class CheckFailed(Exception):
+    # 可直接输出的诊断信息，省略服务器响应体和凭据。
     """A diagnostic that is safe to print without server bodies or credentials."""
 
 
@@ -35,6 +37,7 @@ def validate_url(value):
     require(not url.username and not url.password, "Credentials must not appear in the URL")
     require(not url.query and not url.fragment and url.path in ("", "/"), "Use the API origin without a path, query or fragment")
     # Basic authentication over HTTP is permitted only through a loopback SSH tunnel.
+    # HTTP Basic 认证仅允许使用回环 HTTP 地址，远程部署可通过 SSH 隧道访问。
     require(url.scheme == "https" or url.hostname in ("localhost", "127.0.0.1", "::1"), "Use HTTPS or a loopback SSH tunnel for authentication")
     return value.rstrip("/")
 
@@ -45,6 +48,7 @@ class Client:
         token = base64.b64encode(f"{username}:{password}".encode()).decode()
         self.authorization = "Basic " + token
         # Do not forward deployment credentials through environment-configured proxies.
+        # 禁用环境变量配置的代理，避免部署凭据经过代理转发。
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
     def call(self, path, body=None, expected=200, authenticated=True):
@@ -96,6 +100,7 @@ def write_record(handle, record):
 
 def exercise(client, username, record_path, timeout):
     # Reserve the receipt before creating anything. Never overwrite a previous test.
+    # 写入服务端之前先独占创建回执文件，保留已有测试记录。
     descriptor = os.open(record_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         record = {"version": 1, "status": "pending", "api_url": client.base_url, "username": username}
@@ -112,6 +117,7 @@ def exercise(client, username, record_path, timeout):
         record.update(job_id=receipt["job_id"], message_id=receipt["message_id"])
         write_record(handle, record)
         # Reuse the same idempotency contract exercised by backend/app/smoke.py.
+        # 用相同的提交键重试，验证与 backend/app/smoke.py 相同的幂等约定。
         require(client.call(path, payload, expected=202) == receipt, "Duplicate submission returned a different receipt")
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -124,6 +130,7 @@ def exercise(client, username, record_path, timeout):
         else:
             raise CheckFailed("Timed out waiting for job completion; receipt retained, no automatic resubmission")
         # The existing API exposes conversation metadata through its list endpoint.
+        # 通过现有会话列表接口查询会话元数据。
         conversations = client.call("/conversations?limit=500")
         require(any(item["id"] == conversation for item in conversations), "Created conversation is absent from the recent conversation list")
         messages = client.history(conversation)

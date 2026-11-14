@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 以只读方式检查 AgentHub API 和 Docker Swarm 服务的健康状态。
 """Read-only checks for AgentHub API and Docker Swarm service health."""
 
 import argparse
@@ -14,6 +15,7 @@ import urllib.request
 
 
 class MonitorFailed(Exception):
+    # 诊断信息省略命令输出和 HTTP 响应体。
     """A concise diagnostic that does not include command or response bodies."""
 
 
@@ -146,6 +148,8 @@ def check_task_health(service, tasks, nodes, manager_id, ssh_target, timeout):
         if node_id == manager_id:
             container_output = run_docker(inspect_args, timeout).strip()
         else:
+            # Check the remote node's identity before inspecting its container.
+            # 检查容器之前，先确认远端节点的身份。
             require(ssh_target, f"{service} has a task on {listed_hostname}; set WORKER_SSH for remote health inspection")
             remote_id = run_remote_docker(ssh_target, ["info", "--format", "{{.Swarm.NodeID}}"], timeout).strip()
             require(remote_id == node_id, "WORKER_SSH reaches a different Swarm node")

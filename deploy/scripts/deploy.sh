@@ -17,6 +17,7 @@ fi
 
 need flock
 # Every operator on this manager must use the same lock file, including other checkouts.
+# 此管理节点上的所有操作者都须使用同一锁文件，即使从不同的检出目录运行。
 exec 9>"$DEPLOY_LOCK_PATH" || fail 'Cannot open deployment lock; arrange manager permissions first'
 flock -n 9 || fail 'Another deployment holds the manager lock'
 stage=preflight
@@ -26,6 +27,8 @@ online_preflight
 target_api=$API_REPLICAS
 target_worker=$WORKER_REPLICAS
 stage=database-startup
+# Quiesce API and worker tasks before running migrations.
+# 执行数据库迁移之前，先停止 API 和 worker 任务。
 API_REPLICAS=0 WORKER_REPLICAS=0 docker stack deploy --detach=true --resolve-image never --with-registry-auth -c "$STACK_FILE" "$STACK"
 wait_stopped "${STACK}_api"
 wait_stopped "${STACK}_worker"
@@ -36,6 +39,8 @@ stage=migration-and-bootstrap
 [[ $(docker service inspect --format '{{.Spec.Mode.Replicated.Replicas}}' "${STACK}_setup") == 0 ]] || fail 'Setup must be at zero before launch'
 [[ $(docker service inspect --format '{{.Spec.TaskTemplate.RestartPolicy.Condition}}' "${STACK}_setup") == none ]] || fail 'Setup must not restart automatically'
 previous=$(docker service ps --no-trunc -q "${STACK}_setup")
+# Exclude historical tasks when verifying the new setup run.
+# 验证本次 setup 执行结果时排除历史任务。
 declare -A seen=()
 while IFS= read -r id; do [[ -z $id ]] || seen["$id"]=1; done <<< "$previous"
 docker service update --detach=true --replicas 1 --force "${STACK}_setup"
@@ -65,6 +70,8 @@ docker service scale --detach=true "${STACK}_setup=0"
 wait_stopped "${STACK}_setup"
 
 stage=application-startup
+# Restore the requested replica counts after setup exits successfully.
+# setup 成功退出后恢复所请求的副本数。
 docker service scale --detach=true "${STACK}_api=$target_api" "${STACK}_worker=$target_worker"
 wait_healthy "${STACK}_api" "$target_api"
 wait_healthy "${STACK}_worker" "$target_worker"
