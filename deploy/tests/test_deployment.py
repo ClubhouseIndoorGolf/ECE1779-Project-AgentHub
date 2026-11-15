@@ -9,9 +9,68 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
-BASH = r"C:\Program Files\Git\bin\bash.exe" if os.name == "nt" else shutil.which("bash")
+
+
+def resolve_bash_path(env=None, platform=None, which=None):
+    env = os.environ if env is None else env
+    platform = os.name if platform is None else platform
+    configured = env.get("GIT_BASH_PATH")
+    if configured:
+        bash_path = Path(configured)
+
+        if not bash_path.is_file():
+            raise RuntimeError(
+                f"GIT_BASH_PATH does not point to a file: {configured}"
+            )
+
+        try:
+            result = subprocess.run(
+                [str(bash_path), "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            )
+        except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+            raise RuntimeError(
+                f"GIT_BASH_PATH is not a working Bash executable: {configured}"
+            ) from exc
+
+        if "GNU bash" not in result.stdout:
+            raise RuntimeError(
+                f"GIT_BASH_PATH is not a GNU Bash executable: {configured}"
+            )
+
+        return str(bash_path)
+    which = shutil.which if which is None else which
+    if platform != "nt":
+        return which("bash")
+
+    git_executable = which("git")
+    if git_executable:
+        git_directory = Path(git_executable).resolve().parent
+        roots = [git_directory]
+        if git_directory.name.lower() in {"bin", "cmd"}:
+            roots.insert(0, git_directory.parent)
+        for root in roots:
+            for candidate in (root / "bin" / "bash.exe", root / "usr" / "bin" / "bash.exe"):
+                if candidate.is_file():
+                    return str(candidate)
+
+    for variable in ("ProgramFiles", "ProgramFiles(x86)"):
+        program_files = env.get(variable)
+        if program_files:
+            candidate = Path(program_files) / "Git" / "bin" / "bash.exe"
+            if candidate.is_file():
+                return str(candidate)
+
+    raise RuntimeError("Git Bash was not found. Set GIT_BASH_PATH to the full path of bash.exe.")
+
+
+BASH = resolve_bash_path()
 
 
 def bash_path(path):
@@ -189,6 +248,113 @@ class DeploymentTests(unittest.TestCase):
         command = 'export PATH="$TEST_BIN:$PATH"; exec bash "$1" "$2"'
         return subprocess.run([BASH, "-c", command, "test", bash_path(ROOT / "deploy/scripts" / script), mode], env=self.env, capture_output=True, text=True, timeout=40)
 
+    def run_health_probe(self, delay, health="healthy", timeout=3):
+        docker = self.bin / "docker"
+        self.probe_trace = self.directory / "probe-trace.log"
+        docker.write_text(
+            "#!/usr/bin/env bash\n"
+            'printf "%s\\n" "$*" >> "$PROBE_TRACE"; '
+            'if [[ "$1 $2" == "service inspect" ]]; then printf "completed\\n"; '
+            'elif [[ "$1 $2" == "service ps" ]]; then printf "task-1\\n"; '
+            'elif [[ "$1" == inspect && "$*" == *"type task"* ]]; then printf "manager|running|container-1\\n"; '
+            f'elif [[ "$1" == inspect && "$*" == *"State.Health"* ]]; then sleep {delay}; printf "health-result:{health}\\n" >> "$PROBE_TRACE"; printf "{health}\\n"; '
+            'else exit 90; fi\n',
+            newline="\n",
+        )
+        docker.chmod(0o755)
+        command = 'export PATH="$TEST_BIN:$PATH" MANAGER_ID=manager DEPLOY_TIMEOUT="$PROBE_TIMEOUT"; source "$COMMON_SH"; wait_healthy api 1'
+        env = self.env | {
+            "PROBE_TIMEOUT": str(timeout),
+            "COMMON_SH": bash_path(ROOT / "deploy/scripts/common.sh"),
+            "PROBE_TRACE": str(self.probe_trace),
+        }
+        return subprocess.run([BASH, "-c", command], env=env, capture_output=True, text=True, timeout=12)
+
+    def run_simulated_health_probe(self, delay, health="healthy", timeout=30):
+        self.probe_trace = self.directory / "probe-trace.log"
+        command = r'''
+export MANAGER_ID=manager DEPLOY_TIMEOUT="$PROBE_TIMEOUT"
+source "$COMMON_SH"
+timeout() {
+    while [[ $1 == --* ]]; do shift; done
+    shift
+    "$@"
+}
+docker() {
+    printf '%s\n' "$*" >> "$PROBE_TRACE"
+    if [[ "$1 $2" == "service inspect" ]]; then
+        printf 'completed\n'
+    elif [[ "$1 $2" == "service ps" ]]; then
+        printf 'task-1\n'
+    elif [[ "$1" == inspect && "$*" == *"type task"* ]]; then
+        printf 'manager|running|container-1\n'
+    elif [[ "$1" == inspect && "$*" == *"State.Health"* ]]; then
+        local health_probe=1
+        command sleep "$PROBE_DELAY"
+        printf 'health-result:%s\n' "$PROBE_HEALTH" >> "$PROBE_TRACE"
+        printf '%s\n' "$PROBE_HEALTH"
+    else
+        return 90
+    fi
+}
+sleep() {
+    if [[ ${health_probe:-0} == 1 ]]; then
+        command sleep "$@"
+    else
+        SECONDS=$deadline
+    fi
+}
+wait_healthy api 1
+'''
+        env = self.env | {
+            "PROBE_DELAY": str(delay),
+            "PROBE_HEALTH": health,
+            "PROBE_TIMEOUT": str(timeout),
+            "COMMON_SH": bash_path(ROOT / "deploy/scripts/common.sh"),
+            "PROBE_TRACE": str(self.probe_trace),
+        }
+        return subprocess.run([BASH, "-c", command], env=env, capture_output=True, text=True, timeout=12)
+
+    def test_wait_healthy_accepts_probe_completed_before_deadline(self):
+        result = self.run_simulated_health_probe(delay=0, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("1 healthy tasks", result.stdout)
+        self.assertIn("health-result:healthy", self.probe_trace.read_text())
+
+    def test_wait_healthy_rejects_healthy_probe_completed_after_deadline(self):
+        result = self.run_simulated_health_probe(delay=2, timeout=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("timeout", result.stderr.lower())
+        self.assertIn("State.Health", self.probe_trace.read_text())
+        self.assertIn("health-result:healthy", self.probe_trace.read_text())
+
+    def test_wait_healthy_terminates_hanging_probe_within_bound(self):
+        result = self.run_health_probe(delay=30, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("timeout", result.stderr.lower())
+        self.assertIn("State.Health", self.probe_trace.read_text())
+
+    def test_wait_healthy_does_not_accept_unhealthy_probe(self):
+        result = self.run_simulated_health_probe(
+            delay=0,
+            health="unhealthy",
+            timeout=10,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        trace = self.probe_trace.read_text()
+        self.assertIn("health-result:unhealthy", trace)
+        self.assertIn("Health/convergence timeout", result.stderr)
+        self.assertNotIn("healthy tasks", result.stdout)
+
+    def test_expired_deadline_does_not_start_a_probe(self):
+        command = 'source "$COMMON_SH"; probe_before_deadline "$((SECONDS - 1))" true; status=$?; test "$status" -eq 124'
+        env = os.environ.copy() | {
+            "COMMON_SH": bash_path(ROOT / "deploy/scripts/common.sh"),
+        }
+        result = subprocess.run([BASH, "-c", command], env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
     def mutations(self):
         return [call for call in self.state()["calls"] if call["args"][:2] in (["stack", "deploy"], ["service", "update"], ["service", "scale"])]
 
@@ -298,6 +464,106 @@ class DeploymentTests(unittest.TestCase):
                 finally:
                     for key in changes:
                         self.env.pop(key)
+
+
+class ReleaseWorkflowTests(unittest.TestCase):
+    def test_digest_summary_uses_full_verified_image_reference(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn('Deploy by digest: `%s`', workflow)
+        self.assertIn('"$image@$digest"', workflow)
+        self.assertIn('docker pull "$image@$digest"', workflow)
+        self.assertIn('docker image inspect "$image@$digest"', workflow)
+
+
+
+class GitBashDiscoveryTests(unittest.TestCase):
+    def test_configured_path_takes_precedence_and_preserves_spaces(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            configured = Path(temporary) / "Git Tools" / "bash.exe"
+            configured.parent.mkdir()
+            configured.touch()
+
+            def unexpected_discovery(command):
+                self.fail(f"Unexpected PATH lookup for {command}")
+
+            fake_result = subprocess.CompletedProcess(
+                args=[str(configured), "--version"],
+                returncode=0,
+                stdout="GNU bash, version 5.2.0\n",
+                stderr="",
+            )
+
+            with patch("subprocess.run", return_value=fake_result):
+                self.assertEqual(
+                    resolve_bash_path(
+                        {"GIT_BASH_PATH": str(configured)},
+                        "nt",
+                        unexpected_discovery,
+                    ),
+                    str(configured),
+                )
+
+    def test_invalid_configured_path_explains_the_variable(self):
+        with self.assertRaisesRegex(RuntimeError, "GIT_BASH_PATH"):
+            resolve_bash_path({"GIT_BASH_PATH": "missing bash.exe"}, "nt")
+
+    def test_non_executable_configured_path_explains_the_variable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            configured = Path(temporary) / "bash.exe"
+            configured.touch()
+            with patch("subprocess.run", side_effect=PermissionError("not executable")):
+                with self.assertRaisesRegex(RuntimeError, "GIT_BASH_PATH.*working Bash"):
+                    resolve_bash_path({"GIT_BASH_PATH": str(configured)}, "nt")
+
+    def test_discovers_bash_relative_to_git_executable_without_searching_for_wsl_bash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            git_root = Path(temporary) / "Git Tools"
+            git_executable = git_root / "cmd" / "git.exe"
+            bash_executable = git_root / "bin" / "bash.exe"
+            git_executable.parent.mkdir(parents=True)
+            bash_executable.parent.mkdir(parents=True)
+            git_executable.touch()
+            bash_executable.touch()
+            lookups = []
+
+            def find_executable(command):
+                lookups.append(command)
+                return str(git_executable) if command == "git" else None
+
+            self.assertEqual(
+                resolve_bash_path({}, "nt", find_executable), str(bash_executable)
+            )
+            self.assertEqual(lookups, ["git"])
+
+    def test_falls_back_to_both_windows_program_files_locations(self):
+        for variable in ("ProgramFiles", "ProgramFiles(x86)"):
+            with self.subTest(variable=variable), tempfile.TemporaryDirectory() as temporary:
+                install_root = Path(temporary) / "Windows Git"
+                bash_executable = install_root / "Git" / "bin" / "bash.exe"
+                bash_executable.parent.mkdir(parents=True)
+                bash_executable.touch()
+
+                def no_git(_command):
+                    return None
+
+                self.assertEqual(
+                    resolve_bash_path({variable: str(install_root)}, "nt", no_git),
+                    str(bash_executable),
+                )
+
+    def test_unavailable_git_bash_reports_how_to_configure_it(self):
+        with self.assertRaisesRegex(RuntimeError, "GIT_BASH_PATH"):
+            resolve_bash_path({}, "nt", lambda _command: None)
+
+    def test_linux_ci_still_discovers_bash_from_path(self):
+        lookups = []
+
+        def find_executable(command):
+            lookups.append(command)
+            return "/usr/bin/bash"
+
+        self.assertEqual(resolve_bash_path({}, "posix", find_executable), "/usr/bin/bash")
+        self.assertEqual(lookups, ["bash"])
 
 
 if __name__ == "__main__":

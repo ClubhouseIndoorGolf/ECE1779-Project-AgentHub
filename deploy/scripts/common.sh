@@ -56,7 +56,7 @@ configure() {
     directory) ;;
     *) fail 'STORAGE_MODE must be volume or directory' ;;
   esac
-  need docker; need python3
+  need docker; need python3; need timeout
   SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
   STACK_FILE="$SCRIPT_DIR/../swarm/stack.yaml"
   # Never print rendered configuration or feed it through interpolation twice.
@@ -103,25 +103,41 @@ wait_stopped() {
   done
 }
 
+probe_before_deadline() {
+  local deadline=$1 remaining
+  shift
+  remaining=$((deadline - SECONDS))
+  (( remaining > 0 )) || return 124
+  timeout --signal=TERM --kill-after=1s "${remaining}s" "$@"
+}
+
 wait_healthy() {
-  local service=$1 expected=$2 deadline=$((SECONDS + DEPLOY_TIMEOUT)) ids id record node container state count total health update
+  local service=$1 expected=$2 deadline=$((SECONDS + DEPLOY_TIMEOUT)) ids id record node container state count total health update quoted
   while (( SECONDS < deadline )); do
-    update=$(docker service inspect --format '{{if .UpdateStatus}}{{.UpdateStatus.State}}{{end}}' "$service") || fail "Cannot inspect $service"
+    update=$(probe_before_deadline "$deadline" docker service inspect --format '{{if .UpdateStatus}}{{.UpdateStatus.State}}{{end}}' "$service") || fail "Cannot inspect $service before health-check deadline"
     case $update in paused|rollback*) fail "Update failed for $service; inspect task history privately" ;; esac
-    ids=$(docker service ps --no-trunc -q --filter desired-state=running "$service") || fail "Cannot list $service tasks"
+    ids=$(probe_before_deadline "$deadline" docker service ps --no-trunc -q --filter desired-state=running "$service") || fail "Cannot list $service tasks before health-check deadline"
     count=0; total=0
     while IFS= read -r id; do
       [[ -n $id ]] || continue
       total=$((total + 1))
-      record=$(docker inspect --type task --format '{{.NodeID}}|{{.Status.State}}|{{if .Status.ContainerStatus}}{{.Status.ContainerStatus.ContainerID}}{{end}}' "$id") || fail 'Cannot inspect task'
+      record=$(probe_before_deadline "$deadline" docker inspect --type task --format '{{.NodeID}}|{{.Status.State}}|{{if .Status.ContainerStatus}}{{.Status.ContainerStatus.ContainerID}}{{end}}' "$id") || fail 'Cannot inspect task before health-check deadline'
       IFS='|' read -r node state container <<< "$record"
       [[ $state == running && -n $container ]] || continue
-      health=$(on_node "$node" docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container" 2>/dev/null) || health=unavailable
+      if [[ $node == "$MANAGER_ID" ]]; then
+        health=$(probe_before_deadline "$deadline" docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container" 2>/dev/null) || health=unavailable
+      else
+        [[ $node == "$WORKER_ID" && -n ${WORKER_SSH:-} ]] || fail 'Unknown remote node'
+        printf -v quoted '%q ' docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container"
+        health=$(probe_before_deadline "$deadline" ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 "$WORKER_SSH" "$quoted" 2>/dev/null) || health=unavailable
+      fi
+      (( SECONDS < deadline )) || fail "Health/convergence timeout for $service; no automatic retry or rollback performed"
       [[ $health != healthy ]] || count=$((count + 1))
     done <<< "$ids"
     # Count only healthy tasks that Swarm still wants running.
     # 仅统计 Swarm 期望继续运行且健康的任务。
     if (( count == expected && total == expected )) && [[ $update != updating ]]; then
+      (( SECONDS < deadline )) || fail "Health/convergence timeout for $service; no automatic retry or rollback performed"
       note "$service: $count healthy tasks"
       return
     fi

@@ -17,7 +17,7 @@ not guarantee placement. PostgreSQL has one replica pinned to the only node
 with `agenthub.db=true`; a DigitalOcean Volume is mounted on that node.
 
 The automation runs **on the native Linux manager**, using its local Unix-socket
-Docker context, Bash 4+, Python 3.10+, Docker CLI/Engine, `flock`, `findmnt`,
+Docker context, Bash 4+, Python 3.10+, Docker CLI/Engine, GNU `timeout`, `flock`, `findmnt`,
 `mountpoint`, `readlink`, `find`, and SSH. Use a privileged deployment account
 that can inspect Docker and read the PostgreSQL directory. Docker access is
 effectively administrative access. Arrange permissions on the shared lock file.
@@ -276,14 +276,26 @@ list limit; the rehearsal account should be quiet during the check.
 From Windows PowerShell, without contacting the running stack:
 
 ```powershell
+# Set this to the installed Git Bash executable; paths with spaces are supported.
+$env:GIT_BASH_PATH = "D:\Git\bin\bash.exe"
 Get-ChildItem deploy/scripts/*.sh | ForEach-Object {
-    & 'C:\Program Files\Git\bin\bash.exe' -n $_.FullName
+    & $env:GIT_BASH_PATH -n $_.FullName
     if ($LASTEXITCODE -ne 0) { throw 'Bash syntax check failed' }
 }
+# The deployment unit tests use this same GIT_BASH_PATH setting.
 python -m unittest discover -s deploy/tests -v
 python deploy/scripts/smoke.py --plan
 python deploy/scripts/monitor.py --plan
 ```
+
+When `GIT_BASH_PATH` is unset, the unit tests first locate `git.exe` on `PATH`
+and find `bin\bash.exe` or `usr\bin\bash.exe` in that Git installation. They
+then check `Git\bin\bash.exe` under `ProgramFiles` and `ProgramFiles(x86)`. They
+do not search for a generic `bash.exe`, which could select WSL. If Git Bash is
+not found, the tests report how to set `GIT_BASH_PATH`. Set that variable in the
+same PowerShell session for both the syntax checks and unit tests when you need
+to select a nonstandard installation. PowerShell passes paths containing spaces
+as one argument.
 
 Use the existing runbook's placeholder environment for `docker stack config`.
 Unit tests use temporary files, a fake Docker CLI and a mock API on an ephemeral

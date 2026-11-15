@@ -83,7 +83,7 @@ jobs:
             echo '::error::Published digest does not match the runtime image tested by CI'
             exit 1
           fi
-          printf 'Tested revision: `%s`\n\nVersioned image: `%s:%s`\n\nDeploy by digest: `%s`\n' "$GITHUB_SHA" "$image" "$tag" "$digest" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Tested revision: `%s`\n\nVersioned image: `%s:%s`\n\nDeploy by digest: `%s`\n' "$GITHUB_SHA" "$image" "$tag" "$image@$digest" >> "$GITHUB_STEP_SUMMARY"
       - name: Remove runner registry credentials
         if: always()
         run: docker logout ghcr.io
