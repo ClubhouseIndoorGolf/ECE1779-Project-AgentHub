@@ -107,12 +107,26 @@ function connection(state = "") {
   footer?.classList?.toggle("reconnecting", state === "reconnecting");
 }
 
-/** Record a streamed job state and wake every caller waiting for that job.
- * 记录推送的任务状态，并唤醒所有正在等待该任务的调用方。
+/** Order job states along the worker's lifecycle; each claim increments attempts.
+ * QUEUED(n) = 2n, RUNNING(n) = 2n - 1, terminal states last, so a retry still moves forward.
+ * 按 Worker 生命周期给任务状态排序；每次领取都会增加 attempts，因此重试后的状态仍然向前推进。
  */
-function noteJob(job) {
-  jobStates.set(job.id, job);
-  for (const wake of [...(jobWaiters.get(job.id) || [])]) wake(job);
+function jobProgress(job) {
+  if (job.status === "SUCCEEDED" || job.status === "FAILED") return Infinity;
+  const attempts = Number(job.attempts) || 0;
+  return job.status === "RUNNING" ? 2 * attempts - 1 : 2 * attempts;
+}
+
+/** Record a pushed or polled job state, ignoring older states, and wake its waiters.
+ * 记录推送或轮询得到的任务状态，忽略较旧的状态，并唤醒等待该任务的调用方。
+ */
+function noteJob(job, jobId = job.id) {
+  const known = jobStates.get(jobId);
+  // A delayed response or stale cache entry must never move the displayed state backwards.
+  // 延迟到达的响应或旧缓存不能让界面显示的状态倒退。
+  if (known && jobProgress(known) > jobProgress(job)) return;
+  jobStates.set(jobId, job);
+  for (const wake of [...(jobWaiters.get(jobId) || [])]) wake(job);
 }
 
 /** Resolve with the next streamed state of one job, or null after a timeout.
@@ -147,7 +161,11 @@ async function nextJob(jobId, lastStatus) {
   } else if (lastStatus !== undefined) await sleep(750);
   // The first fallback check runs immediately, matching the original polling behaviour.
   // 后备轮询的第一次查询立即执行，与原有轮询行为一致。
-  return api("/jobs/" + jobId);
+  const polled = await api("/jobs/" + jobId);
+  // Merge into the same cache so pushed and polled states share one forward-only view.
+  // 合并到同一缓存，使推送与轮询的状态共享一个只进不退的视图。
+  noteJob(polled, jobId);
+  return jobStates.get(jobId);
 }
 
 /** Report whether the open conversation currently receives pushed updates.
@@ -158,15 +176,26 @@ function streamLive() {
 }
 
 /** Refresh history once after a burst of pushed changes, reusing the stale-read guards.
+ * A failed read retries with backoff, because a live stream may send only heartbeats afterwards.
  * 一批推送变化到达后只刷新一次历史，并复用防止旧响应覆盖的保护逻辑。
+ * 读取失败时按退避重试，因为之后实时流可能只发送心跳，不会再触发刷新。
  */
-function scheduleRefresh() {
+function scheduleRefresh(delay = 150, attempt = 0) {
   clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(() => {
-    if (!stream || stream.conversation !== conversation) return;
-    renderMessages(awaitingReply).catch(() => {});
+  refreshTimer = setTimeout(async () => {
+    const current = stream;
+    if (!current || current.conversation !== conversation) return;
+    try {
+      await renderMessages(awaitingReply);
+    } catch {
+      // A newer event or navigation cancels this retry through clearTimeout or the stream check.
+      // 新事件或会话切换会通过 clearTimeout 或事件流检查取消本次重试。
+      if (stream === current && current.conversation === conversation)
+        scheduleRefresh(Math.min(1000 * 2 ** attempt, 10000), attempt + 1);
+      return;
+    }
     listConversations().catch(() => {});
-  }, 150);
+  }, delay);
 }
 
 /** Close the current stream; navigation and sign-out must not keep old account data flowing.

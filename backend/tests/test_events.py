@@ -34,7 +34,9 @@ def read_stream(client, conversation, last_event_id=None, **kwargs):
     """Read one bounded stream and return parsed (event, id, data) frames.
     读取一个有时限的事件流，并解析为 (事件名, id, 数据) 列表。
     """
-    headers = {} if last_event_id is None else {"Last-Event-ID": str(last_event_id)}
+    if last_event_id is not None and not isinstance(last_event_id, bytes):
+        last_event_id = str(last_event_id)
+    headers = {} if last_event_id is None else {"Last-Event-ID": last_event_id}
     response = client.get(f"/conversations/{conversation}/events", headers=headers, **kwargs)
     assert response.status_code == 200, response.text
     assert response.headers["content-type"].startswith("text/event-stream")
@@ -148,7 +150,36 @@ def test_proposal_changes_are_streamed(client):
 
 
 @pytest.mark.parametrize(
-    "value, expected", [(None, None), ("", None), ("7", 7), (" 12 ", 12), ("-1", None), ("x", None)]
+    "value, expected",
+    [
+        (None, None),
+        ("", None),
+        ("7", 7),
+        (" 12 ", 12),
+        ("-1", None),
+        ("x", None),
+        # Unicode digits that str.isdigit() accepts but are not ASCII sequence numbers.
+        # str.isdigit() 接受但并非 ASCII 顺序号的 Unicode 数字字符。
+        ("²", None),
+        ("١٢", None),
+        (str(2**63 - 1), 2**63 - 1),
+        (str(2**63), None),
+        ("9" * 20, None),
+    ],
 )
 def test_parse_last_event_id(value, expected):
     assert events.parse_last_event_id(value) == expected
+
+
+def test_unicode_last_event_id_starts_fresh(client):
+    """A cursor that int() cannot parse is treated as a new connection instead of failing.
+    int() 无法解析的游标按新连接处理，而不是返回服务器错误。
+    """
+    conversation, _, _ = submit(client)
+    # Send raw Latin-1 bytes as a browser or proxy could; the server decodes them back to "²".
+    # 像浏览器或代理那样发送原始 Latin-1 字节；服务端会将其解码回 "²"。
+    assert read_stream(client, conversation, last_event_id="²".encode("latin-1"))[0] == (
+        "ready",
+        "1",
+        {"cursor": 1},
+    )

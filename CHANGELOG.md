@@ -5,6 +5,7 @@
 ### 2026-11-14
 
 - **Live updates over SSE.** `GET /conversations/{id}/events` streams new messages, job status changes and proposal status changes for an owned conversation. `Last-Event-ID` replays messages after the given sequence, and each stream closes after five minutes so clients reconnect. The browser follows sends and approved continuations through pushed events, reconnects with backoff, and falls back to polling when no stream is live. The footer shows the connection state. No schema change. [Live updates guide](docs/LIVE_UPDATES.md)
+- **Live update review fixes.** A history refresh triggered by a pushed event retries with backoff after a failed read. Polled and pushed job states share one cache that never moves backwards, including across retries. A `Last-Event-ID` with non-ASCII digits, such as `²`, starts a fresh stream instead of returning HTTP 500.
 
 ### 2026-11-11
 

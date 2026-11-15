@@ -4,6 +4,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from datetime import timedelta
@@ -32,6 +33,8 @@ MAX_STREAM_SECONDS = 300.0
 JOB_LOOKBACK = timedelta(seconds=5)
 REPLAY_PAGE = 500
 ACTIVE_JOB_STATES = ("QUEUED", "RUNNING")
+LAST_EVENT_ID = re.compile(r"[0-9]{1,19}")
+MAX_SEQ = 2**63 - 1
 
 
 def encode(event: str, data: str, event_id: int | None = None) -> str:
@@ -43,12 +46,15 @@ def encode(event: str, data: str, event_id: int | None = None) -> str:
 
 
 def parse_last_event_id(value: str | None) -> int | None:
-    """Accept a non-negative message sequence and ignore anything else.
-    只接受非负整数的消息顺序号，其他值一律忽略并按新连接处理。
+    """Accept a non-negative ASCII message sequence within BIGINT range and ignore anything else.
+    只接受 BIGINT 范围内、由 ASCII 数字组成的非负消息顺序号，其他值一律按新连接处理。
     """
-    if value is None or not value.strip().isdigit():
+    # str.isdigit() also accepts characters such as "²" that int() rejects, so match ASCII explicitly.
+    # str.isdigit() 也接受 "²" 等 int() 无法转换的字符，因此显式只匹配 ASCII 数字。
+    if value is None or not LAST_EVENT_ID.fullmatch(value.strip()):
         return None
-    return int(value.strip())
+    seq = int(value.strip())
+    return seq if seq <= MAX_SEQ else None
 
 
 class ConversationStream:

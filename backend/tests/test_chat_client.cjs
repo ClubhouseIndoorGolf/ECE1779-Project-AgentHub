@@ -398,7 +398,7 @@ async function until(check, ms = 3000) {
   }
 }
 
-test("a pushed job event completes a send without polling the job", async () => {
+test("a pushed job event completes a send without polling the job", async t => {
   let stream, jobPolls = 0, done = false;
   const user = { seq: 1, role: "user", content: "Hi" };
   const assistant = { seq: 2, role: "assistant", content: "Message received." };
@@ -413,6 +413,9 @@ test("a pushed job event completes a send without polling the job", async () => 
     if (url === "/jobs/job-1") { jobPolls++; return response({ status: "QUEUED" }); }
     throw new Error("Unexpected request: " + url);
   }, streamingGlobals);
+  // Close the stream even when an assertion fails, so the runner cannot hang.
+  // 即使断言失败也关闭事件流，避免测试进程挂起。
+  t.after(() => client.run("newChat()"));
   await client.run("authorization = 'Basic test'; openConversation({ id: 'chat-a', title: 'Chat A' })");
   await until(() => stream);
   stream.push('retry: 2000\n\nid: 0\nevent: ready\ndata: {"cursor":0}\n\n');
@@ -434,7 +437,7 @@ test("a pushed job event completes a send without polling the job", async () => 
   assert.equal(client.element("connection-label").textContent, "Local workspace");
 });
 
-test("a dropped stream reconnects with the last message sequence", async () => {
+test("a dropped stream reconnects with the last message sequence", async t => {
   const attempts = [];
   const client = createClient(async (url, options) => {
     if (url === "/conversations/chat-a/events") {
@@ -446,6 +449,9 @@ test("a dropped stream reconnects with the last message sequence", async () => {
     if (url === "/conversations") return response([]);
     throw new Error("Unexpected request: " + url);
   }, streamingGlobals);
+  // Close the stream even when an assertion fails, so the runner cannot hang.
+  // 即使断言失败也关闭事件流，避免测试进程挂起。
+  t.after(() => client.run("newChat()"));
   await client.run("authorization = 'Basic test'; openConversation({ id: 'chat-a', title: 'Chat A' })");
   await until(() => attempts.length === 1);
   assert.equal(attempts[0].headers["Last-Event-ID"], undefined);
@@ -459,16 +465,68 @@ test("a dropped stream reconnects with the last message sequence", async () => {
   client.run("newChat()");
 });
 
-test("a refused stream falls back to polling without retrying", async () => {
+test("a refused stream falls back to polling without retrying", async t => {
   let opens = 0;
   const client = createClient(async url => {
     if (url === "/conversations/chat-a/events") { opens++; return { ok: false, status: 404 }; }
     if (url.includes("/messages?")) return response([]);
     throw new Error("Unexpected request: " + url);
   }, streamingGlobals);
+  // Close the stream even when an assertion fails, so the runner cannot hang.
+  // 即使断言失败也关闭事件流，避免测试进程挂起。
+  t.after(() => client.run("newChat()"));
   await client.run("authorization = 'Basic test'; openConversation({ id: 'chat-a', title: 'Chat A' })");
   await new Promise(resolve => setTimeout(resolve, 400));
   assert.equal(opens, 1);
   assert.equal(client.run("streamLive()"), false);
   client.run("newChat()");
+});
+
+test("a failed refresh after a pushed message retries while the stream only sends heartbeats", async t => {
+  let stream, historyReads = 0;
+  const client = createClient(async (url, options) => {
+    if (url === "/conversations/chat-a/events") {
+      stream = sseResponse(options.signal);
+      return stream.response;
+    }
+    if (url.includes("/messages?")) {
+      historyReads++;
+      // The initial open and the ready refresh succeed; the message-triggered read fails once.
+      // 首次打开与 ready 刷新成功；由消息事件触发的读取失败一次。
+      if (historyReads === 3) return { ok: false, status: 503 };
+      return response(historyReads < 3 ? [] : [{ seq: 1, role: "user", content: "From another tab" }]);
+    }
+    if (url === "/conversations") return response([]);
+    throw new Error("Unexpected request: " + url);
+  }, streamingGlobals);
+  // Close the stream even when an assertion fails, so the runner cannot hang.
+  // 即使断言失败也关闭事件流，避免测试进程挂起。
+  t.after(() => client.run("newChat()"));
+  await client.run("authorization = 'Basic test'; openConversation({ id: 'chat-a', title: 'Chat A' })");
+  await until(() => stream);
+  stream.push('id: 0\nevent: ready\ndata: {"cursor":0}\n\n');
+  await until(() => historyReads === 2);
+  stream.push('id: 1\nevent: message\ndata: {"seq":1}\n\n: keepalive\n\n');
+  await until(() => historyReads === 3);
+  await until(() => client.element("messages").children.length === 1, 4000);
+  assert.equal(client.element("messages").children[0].children[1].textContent, "From another tab");
+  client.run("newChat()");
+});
+
+test("a polled job state is not replaced by an older cached state", async () => {
+  let polls = 0;
+  const client = createClient(async url => {
+    if (url === "/jobs/job-1") { polls++; return response({ status: "RUNNING", attempts: 1 }); }
+    throw new Error("Unexpected request: " + url);
+  });
+  client.run("noteJob({ id: 'job-1', status: 'QUEUED', attempts: 0 })");
+  assert.equal((await client.run("nextJob('job-1', 'QUEUED')")).status, "RUNNING");
+  assert.equal((await client.run("nextJob('job-1', 'RUNNING')")).status, "RUNNING");
+  assert.equal(polls, 2);
+  // A stale push is ignored, while a retry (QUEUED after one claim) still moves forward.
+  // 旧的推送会被忽略；而重试（领取一次后回到 QUEUED）仍视为向前推进。
+  client.run("noteJob({ id: 'job-1', status: 'QUEUED', attempts: 0 })");
+  assert.equal(client.run("jobStates.get('job-1').status"), "RUNNING");
+  client.run("noteJob({ id: 'job-1', status: 'QUEUED', attempts: 1 })");
+  assert.equal(client.run("jobStates.get('job-1').status"), "QUEUED");
 });
