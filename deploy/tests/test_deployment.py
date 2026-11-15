@@ -468,7 +468,7 @@ wait_healthy api 1
 
 class ReleaseWorkflowTests(unittest.TestCase):
     def test_digest_summary_uses_full_verified_image_reference(self):
-        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
         self.assertIn('Deploy by digest: `%s`', workflow)
         self.assertIn('"$image@$digest"', workflow)
         self.assertIn('docker pull "$image@$digest"', workflow)
