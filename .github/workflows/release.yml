@@ -7,6 +7,8 @@ permissions:
   contents: read
 
 concurrency:
+  # Serialize publication on a ref without canceling an active release.
+  # 同一 Git 引用上的发布串行执行，已有发布继续运行。
   group: release-runtime-${{ github.ref }}
   cancel-in-progress: false
 
@@ -18,6 +20,8 @@ jobs:
     with:
       export_runtime_image: true
 
+  # Check the Swarm packaging independently of the backend CI job.
+  # 在后端 CI 之外单独检查 Swarm 部署所需的文件和脚本。
   delivery-checks:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -42,6 +46,8 @@ jobs:
           BOOTSTRAP_PASSWORD_SECRET: validation-bootstrap
         run: docker stack config -c deploy/swarm/stack.yaml > /dev/null
 
+  # Require both the tested image and the deployment checks before pushing.
+  # 测试镜像就绪且部署检查通过后，才推送镜像。
   publish:
     needs: [required-checks, delivery-checks]
     runs-on: ubuntu-latest
@@ -62,6 +68,8 @@ jobs:
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
+        # Load the CI artifact, push its versioned tag, and publish a digest-qualified deploy reference.
+        # 加载 CI 产物，推送带版本的标签，并输出包含镜像摘要的部署引用。
         run: |
           set -euo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY,,}/backend"

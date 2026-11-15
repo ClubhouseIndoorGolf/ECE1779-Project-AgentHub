@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Provide a standalone configuration and cluster check without applying a deployment.
+# 单独检查部署配置和集群，无需执行部署变更。
 set -Eeuo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 

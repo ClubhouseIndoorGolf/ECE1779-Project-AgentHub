@@ -5,6 +5,8 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  # Release runs can request the tested image as a workflow artifact.
+  # 发布流程可请求将已测试镜像保存为工作流产物。
   workflow_call:
     inputs:
       export_runtime_image:
@@ -52,6 +54,8 @@ jobs:
       - name: Validate Compose
         run: docker compose config --quiet
       - name: Build runtime and test images
+        # Build the live smoke image and the test runner from the same checkout.
+        # 从同一份代码构建运行冒烟测试的镜像和测试运行器。
         run: docker compose --profile test build api test
       - name: Lint and format
         run: docker compose run --rm --no-deps test sh -c 'ruff check . && ruff format --check .'
@@ -62,6 +66,8 @@ jobs:
       - name: Start the application
         run: docker compose up -d --wait
       - name: Exercise live API and worker
+        # Exercise queue processing through the running Compose services.
+        # 通过正在运行的 Compose 服务验证任务队列处理。
         run: docker compose exec -T api python -m app.smoke
       - name: Export the tested runtime image
         # Pass the image exercised by the smoke test to the release workflow.
@@ -69,6 +75,8 @@ jobs:
         if: inputs.export_runtime_image == true
         run: docker image save agenthub-ci-backend:dev --output "${{ runner.temp }}/agenthub-runtime.tar"
       - name: Retain the tested image for publication
+        # The release job downloads this artifact from the same workflow run.
+        # 发布任务从同一次工作流运行中下载该产物。
         if: inputs.export_runtime_image == true
         uses: actions/upload-artifact@v4
         with:

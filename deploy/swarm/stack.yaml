@@ -12,6 +12,8 @@ x-app: &app
     PGDATABASE: ${POSTGRES_DB:-agenthub}
     PGUSER: ${POSTGRES_USER:-agenthub}
     PGCONNECT_TIMEOUT: "5"
+    # Use the fixed provider for local and cloud deployments of this stack.
+    # 此 stack 在本地和云端都使用固定回复提供方。
     REPLY_MODE: fixed
   secrets:
     - source: db_password
@@ -24,6 +26,8 @@ x-app: &app
     - 'export PGPASSWORD="$$(cat /run/secrets/db_password)"; test -n "$$PGPASSWORD"; exec "$$@"'
     - --
 
+# Share scheduling preferences and resource budgets across application services.
+# 统一各应用服务的调度偏好和资源预算。
 x-app-deploy: &app-deploy
   mode: replicated
   endpoint_mode: vip
@@ -34,6 +38,8 @@ x-app-deploy: &app-deploy
   restart_policy:
     condition: any
     delay: 5s
+  # Start replacements one at a time and pause the rollout on failure.
+  # 每次启动一个替换副本，更新失败时暂停发布。
   update_config:
     parallelism: 1
     delay: 10s
@@ -61,10 +67,14 @@ services:
     secrets:
       - source: db_password
         target: db_password
+    # Store PostgreSQL files on a directory managed by the database node.
+    # 将 PostgreSQL 文件保存在数据库节点管理的目录中。
     volumes:
       - type: bind
         source: ${POSTGRES_DATA_PATH:?Set POSTGRES_DATA_PATH to the mounted Volume data directory}
         target: /var/lib/postgresql/data
+    # Probe the PostgreSQL listener from inside its container.
+    # 在容器内检查 PostgreSQL 是否已开始接受连接。
     healthcheck:
       test: [CMD-SHELL, 'pg_isready -h 127.0.0.1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
       interval: 10s
@@ -76,6 +86,8 @@ services:
       mode: replicated
       replicas: 1
       endpoint_mode: vip
+      # Pin the database to the node that owns its storage.
+      # 将数据库固定调度到持有数据目录的节点。
       placement:
         constraints:
           - node.platform.os == linux
@@ -110,6 +122,8 @@ services:
         target: db_password
       - source: bootstrap_password
         target: bootstrap_password
+    # Apply all schema revisions before running account bootstrap.
+    # 先应用全部数据库迁移，再执行账号初始化。
     command:
       - /bin/sh
       - -ec
@@ -122,6 +136,8 @@ services:
       disable: true
     deploy:
       <<: *app-deploy
+      # A deployment operator or script explicitly launches each setup run.
+      # 每次 setup 都由部署操作者或脚本显式启动。
       replicas: 0
       restart_policy:
         condition: none
@@ -140,6 +156,8 @@ services:
         published: ${API_PUBLISHED_PORT:-18000}
         protocol: tcp
         mode: ingress
+    # Check the HTTP server from within the task so routing cannot mask an unhealthy replica.
+    # 在任务容器内检查 HTTP 服务，避免路由转发掩盖单个副本异常。
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
       interval: 10s
@@ -155,6 +173,8 @@ services:
     <<: *app
     environment:
       <<: *app-env
+      # Configure how often the worker polls, how long it holds a lease, and how many attempts it makes.
+      # 配置 worker 的轮询频率、租约期限和任务尝试次数上限。
       WORKER_POLL_SECONDS: "1"
       WORKER_LEASE_SECONDS: "60"
       WORKER_MAX_ATTEMPTS: "3"
@@ -177,10 +197,14 @@ services:
       <<: *app-deploy
       replicas: ${WORKER_REPLICAS:-2}
 
+# Give the services a shared network across Swarm nodes.
+# 为所有服务提供跨 Swarm 节点的共享网络。
 networks:
   backend:
     driver: overlay
 
+# Look up credentials that operators have already created in Swarm.
+# 引用操作者已在 Swarm 中创建的凭据。
 secrets:
   db_password:
     external: true

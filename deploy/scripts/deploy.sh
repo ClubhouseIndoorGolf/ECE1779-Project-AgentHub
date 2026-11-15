@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
+# Stage the stack, run setup once, and bring up the requested application replicas.
+# 分阶段部署 stack，执行一次 setup，再启动所需的应用副本。
 set -Eeuo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 
+# Default to printing the plan. Only apply mode can change services.
+# 默认打印部署计划。只有 apply 模式会变更服务。
 mode=${1:---plan}
 [[ $# -le 1 && ( $mode == --plan || $mode == --apply ) ]] || fail 'Usage: bash deploy/scripts/deploy.sh [--plan|--apply]'
 configure
@@ -21,9 +25,13 @@ need flock
 exec 9>"$DEPLOY_LOCK_PATH" || fail 'Cannot open deployment lock; arrange manager permissions first'
 flock -n 9 || fail 'Another deployment holds the manager lock'
 stage=preflight
+# Check the live environment under the lock before changing any service.
+# 在持有部署锁的情况下检查运行环境，然后才变更服务。
 trap 'printf "Deployment stopped during %s. Inspect service/task state before retrying; no automatic recovery performed.\n" "$stage" >&2' ERR
 online_preflight
 
+# Save the requested counts before staging the stack with zero application replicas.
+# 在以零应用副本部署 stack 之前，保存请求的副本数。
 target_api=$API_REPLICAS
 target_worker=$WORKER_REPLICAS
 stage=database-startup
@@ -33,9 +41,13 @@ API_REPLICAS=0 WORKER_REPLICAS=0 docker stack deploy --detach=true --resolve-ima
 wait_stopped "${STACK}_api"
 wait_stopped "${STACK}_worker"
 wait_stopped "${STACK}_setup"
+# Begin setup only after PostgreSQL is healthy and the old tasks are stopped.
+# 等待旧任务停止且 PostgreSQL 健康后，再开始 setup。
 wait_healthy "${STACK}_db" 1
 
 stage=migration-and-bootstrap
+# Require a dormant setup service with retries disabled before launching one task.
+# 启动单次 setup 前，确认服务处于零副本且禁用了自动重启。
 [[ $(docker service inspect --format '{{.Spec.Mode.Replicated.Replicas}}' "${STACK}_setup") == 0 ]] || fail 'Setup must be at zero before launch'
 [[ $(docker service inspect --format '{{.Spec.TaskTemplate.RestartPolicy.Condition}}' "${STACK}_setup") == none ]] || fail 'Setup must not restart automatically'
 previous=$(docker service ps --no-trunc -q "${STACK}_setup")
@@ -46,6 +58,8 @@ while IFS= read -r id; do [[ -z $id ]] || seen["$id"]=1; done <<< "$previous"
 docker service update --detach=true --replicas 1 --force "${STACK}_setup"
 deadline=$((SECONDS + DEPLOY_TIMEOUT))
 selected=''; completed=false
+# Track one new task and use its terminal state and exit code to decide whether to proceed.
+# 跟踪本次新增的唯一任务，根据终态和退出码决定是否继续。
 while (( SECONDS < deadline )); do
   tasks=$(docker service ps --no-trunc -q "${STACK}_setup")
   while IFS= read -r id; do
@@ -66,6 +80,8 @@ while (( SECONDS < deadline )); do
 done
 [[ $completed == true ]] || fail 'Setup timed out; it may still be running. Do not restart it blindly.'
 note 'Alembic migration and bootstrap completed with exit code 0.'
+# Return setup to its dormant state so it is ready for the next deployment.
+# 将 setup 恢复为零副本，为下次部署做好准备。
 docker service scale --detach=true "${STACK}_setup=0"
 wait_stopped "${STACK}_setup"
 

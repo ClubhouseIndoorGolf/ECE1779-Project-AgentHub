@@ -19,11 +19,15 @@ class MonitorFailed(Exception):
     """A concise diagnostic that does not include command or response bodies."""
 
 
+# Route failed checks through the diagnostic handler in main.
+# 将失败的检查交给 main 中的诊断处理。
 def require(condition, message):
     if not condition:
         raise MonitorFailed(message)
 
 
+# Accept a base origin for /health, with HTTPS required away from loopback.
+# 校验 /health 使用的基础地址，非回环地址要求 HTTPS。
 def validate_url(value):
     url = urllib.parse.urlsplit(value)
     require(url.scheme in ("http", "https") and url.hostname, "Expected an HTTP(S) API URL")
@@ -33,6 +37,8 @@ def validate_url(value):
     return value.rstrip("/")
 
 
+# Run a bounded Docker query locally and keep raw diagnostics out of the report.
+# 在本机执行有超时限制的 Docker 查询，报告只包含整理后的诊断信息。
 def run_docker(args, timeout):
     try:
         result = subprocess.run(
@@ -44,8 +50,12 @@ def run_docker(args, timeout):
     return result.stdout
 
 
+# Inspect a remote node using non-interactive SSH and the configured host key.
+# 通过非交互式 SSH 检查远端节点，并校验已配置的主机密钥。
 def run_remote_docker(ssh_target, args, timeout):
     require(bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@:-]*", ssh_target)), "Invalid WORKER_SSH target")
+    # Quote each Docker argument for the shell on the remote node.
+    # 为远端 shell 逐个转义 Docker 参数。
     try:
         result = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", ssh_target, shlex.join(["docker", *args])],
@@ -60,6 +70,8 @@ def run_remote_docker(ssh_target, args, timeout):
     return result.stdout
 
 
+# Verify that the API and its database connection respond successfully.
+# 确认 API 可访问且数据库连接正常。
 def check_api(base_url, timeout):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     request = urllib.request.Request(base_url + "/health", headers={"Accept": "application/json"})
@@ -78,8 +90,12 @@ def check_api(base_url, timeout):
     return health
 
 
+# Parse the stack service list and require both replica counts to match the expected count.
+# 解析 stack 服务列表，核对运行副本数与配置副本数是否都等于预期值。
 def parse_services(output, stack, expected):
     observed = {}
+    # Ignore unrelated names and retain the running and configured counts for each expected service.
+    # 跳过无关服务，记录每个预期服务的运行和配置副本数。
     for line in output.splitlines():
         parts = line.split("|", 1)
         require(len(parts) == 2, "Docker returned an invalid service list")
@@ -100,6 +116,8 @@ def parse_services(output, stack, expected):
     return observed
 
 
+# Build a unique ID-to-hostname map for the expected number of ready, active nodes.
+# 为预期数量的就绪且启用节点建立唯一的 ID 到主机名映射。
 def check_nodes(output, expected_nodes):
     nodes = {}
     for line in output.splitlines():
@@ -115,6 +133,8 @@ def check_nodes(output, expected_nodes):
     return nodes
 
 
+# Require a distinct task ID and node hostname for each expected running replica.
+# 为每个预期运行的副本核验唯一任务 ID 和所属节点的主机名。
 def parse_tasks(output, service, expected_count):
     tasks = []
     for line in output.splitlines():
@@ -126,9 +146,13 @@ def parse_tasks(output, service, expected_count):
     return tasks
 
 
+# Check both the Swarm task state and the container health on its assigned node.
+# 检查 Swarm 任务状态，以及实际所在节点上的容器健康状态。
 def check_task_health(service, tasks, nodes, manager_id, ssh_target, timeout):
     require(manager_id in nodes, "The local Docker daemon is not a listed Swarm node")
     for task_id, listed_hostname in tasks:
+        # Cross-check the task's node with the inventory before inspecting its container.
+        # 在检查容器前，先将任务所在节点与集群清单交叉核对。
         task_output = run_docker(
             ["inspect", "--type", "task", "--format", "{{.Status.State}}|{{.NodeID}}|{{if .Status.ContainerStatus}}{{.Status.ContainerStatus.ContainerID}}{{end}}", task_id],
             timeout,
@@ -154,6 +178,8 @@ def check_task_health(service, tasks, nodes, manager_id, ssh_target, timeout):
             remote_id = run_remote_docker(ssh_target, ["info", "--format", "{{.Swarm.NodeID}}"], timeout).strip()
             require(remote_id == node_id, "WORKER_SSH reaches a different Swarm node")
             container_output = run_remote_docker(ssh_target, inspect_args, timeout).strip()
+        # The container must be running and report an explicit healthy status.
+        # 容器必须正在运行，且明确报告健康状态。
         container_fields = container_output.split("|", 1)
         require(len(container_fields) == 2, f"Docker returned invalid {service} container health")
         container_state, health = container_fields
@@ -161,6 +187,8 @@ def check_task_health(service, tasks, nodes, manager_id, ssh_target, timeout):
         require(health == "healthy", f"{service} container on {listed_hostname} health is {health}; expected healthy")
 
 
+# Inspect only tasks Swarm still wants running so historical tasks do not count as replicas.
+# 只检查 Swarm 当前期望运行的任务，避免将历史任务算作副本。
 def check_service_tasks(stack, service, expected_count, nodes, manager_id, ssh_target, timeout):
     output = run_docker(
         ["service", "ps", "--no-trunc", "--filter", "desired-state=running", "--format", "{{.ID}}|{{.Node}}", f"{stack}_{service}"],
@@ -171,6 +199,8 @@ def check_service_tasks(stack, service, expected_count, nodes, manager_id, ssh_t
     return len(tasks)
 
 
+# Read a positive replica count from the environment when the CLI omits it.
+# 命令行未指定副本数时，从环境变量读取正整数。
 def positive_env_int(name, default):
     value = os.environ.get(name, str(default))
     try:
@@ -181,6 +211,8 @@ def positive_env_int(name, default):
     return parsed
 
 
+# Combine the API, Swarm service, and per-container checks into one snapshot.
+# 将 API、Swarm 服务与逐容器检查汇总为一次运行状态快照。
 def monitor(stack, base_url, api_replicas, worker_replicas, expected_nodes, timeout):
     health = check_api(base_url, timeout)
     service_output = run_docker(
@@ -192,6 +224,8 @@ def monitor(stack, base_url, api_replicas, worker_replicas, expected_nodes, time
         stack,
         {"api": api_replicas, "worker": worker_replicas, "db": 1, "setup": 0},
     )
+    # Resolve node identities so each task is checked through its own Docker daemon.
+    # 识别节点身份，以便通过任务所属节点的 Docker daemon 检查该任务。
     node_output = run_docker(
         ["node", "ls", "--format", "{{.ID}}|{{.Hostname}}|{{.Status}}|{{.Availability}}|{{.ManagerStatus}}"],
         timeout,
@@ -205,6 +239,8 @@ def monitor(stack, base_url, api_replicas, worker_replicas, expected_nodes, time
     return health, replicas, nodes
 
 
+# Validate CLI options and choose between a dry plan and a read-only health check.
+# 校验命令行参数，并选择仅显示计划或执行只读健康检查。
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", action="store_true", help="Describe checks without network or Docker access")
@@ -217,12 +253,16 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         require(bool(re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.stack)), "Invalid Swarm stack name")
+        # Explicit CLI counts override the deployment environment.
+        # 命令行明确指定的副本数优先于部署环境变量。
         api_replicas = args.api_replicas if args.api_replicas is not None else positive_env_int("API_REPLICAS", 2)
         worker_replicas = args.worker_replicas if args.worker_replicas is not None else positive_env_int("WORKER_REPLICAS", 2)
         require(api_replicas > 0 and worker_replicas > 0, "Application replica counts must be positive")
         require(args.expected_nodes in (1, 2), "--expected-nodes must be 1 or 2")
         require(1 <= args.timeout <= 120, "Timeout must be between 1 and 120 seconds")
         base_url = validate_url(args.url)
+        # Return before contacting the API or Docker in plan mode.
+        # 计划模式在访问 API 或 Docker 之前返回。
         if args.plan:
             print("PLAN: GET /health, read AgentHub service replica counts, inspect API/worker/PostgreSQL task and container health on their Swarm nodes, and check the expected node count/readiness. No changes made.")
             return 0
