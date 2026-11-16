@@ -29,6 +29,7 @@ Each connection tracks the state it has already sent, so it sends a job or propo
 
 - **Starting and stopping.** Opening or creating a conversation starts its stream. Starting a new chat or signing out closes it.
 - **Reconnection.** After a normal close, the client reconnects within 250 ms. After a failure, it backs off from 1 s to at most 15 s with jitter. A stream with no data for 45 seconds is treated as dropped. A `401` or `404` stops the stream without retrying.
+- **Reauthentication.** A `401` from the event stream or a history refresh it triggered stops live updates, cancels scheduled refresh retries, and opens the sign-in dialog. The client compares the user ID returned by `GET /me` with the previous user's ID. The same account keeps its open conversation and draft and reconnects. A different account starts with an empty chat and loads its own conversation list. The previous account's messages, drafts, and pending submission state are cleared, and late responses from its workspace are ignored.
 - **Using events.** `job` events complete message sends and approved refund continuations immediately. `message`, `proposal` and `ready` events trigger one debounced history refresh, which reuses the existing stale-response guards.
 - **Fallback.** While no stream is live, or where the browser lacks body streams, the client polls `/jobs/{id}` as before. When a stream is live, it confirms a job over REST if no event arrives within 5 seconds.
 - **Status.** The footer shows **Live updates** (green), **Reconnecting…** (amber) or **Local workspace**.
@@ -38,7 +39,7 @@ Each connection tracks the state it has already sent, so it sends a job or propo
 Automated coverage:
 
 - [test_events.py](../backend/tests/test_events.py) covers ownership, the fresh cursor, `Last-Event-ID` replay, live job and reply events, and proposal approval progress.
-- [test_chat_client.cjs](../backend/tests/test_chat_client.cjs) covers completing a send from a pushed job event without polling, parsing a frame split across chunks, reconnecting with `Last-Event-ID`, and the polling fallback after `404`.
+- [test_chat_client.cjs](../backend/tests/test_chat_client.cjs) covers completing a send from a pushed job event without polling, parsing a frame split across chunks, reconnecting with `Last-Event-ID`, and the polling fallback after `404`. It also verifies draft retention after signing back in to the same account and workspace isolation when a different account signs in during an in-flight send.
 
 Manual check against the running stack, with credentials from your private `.env`:
 

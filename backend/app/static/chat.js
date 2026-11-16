@@ -7,6 +7,7 @@
  */
 const $ = id => document.getElementById(id);
 let authorization = null;
+let accountId = null;
 let conversation = null;
 let busy = false;
 let generation = 0;
@@ -37,10 +38,10 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 /** Call an authenticated same-origin endpoint with a bounded request timeout.
  * 携带内存中的认证信息调用同源接口，并限制单次请求的等待时间。
  */
-async function api(path, body) {
+async function api(path, body, credentials = authorization) {
   const response = await fetch(path, {
     method: body === undefined ? "GET" : "POST",
-    headers: { Authorization: authorization, "Content-Type": "application/json" },
+    headers: { Authorization: credentials, "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
     cache: "no-store",
     signal: AbortSignal.timeout(15000),
@@ -151,6 +152,7 @@ function waitForJobEvent(jobId, ms) {
  * 获取任务的下一个状态：实时流连接时由服务端推送，否则退回 REST 轮询。
  */
 async function nextJob(jobId, lastStatus) {
+  const activeGeneration = generation;
   const known = jobStates.get(jobId);
   if (known && known.status !== lastStatus) return known;
   if (streamLive()) {
@@ -161,7 +163,9 @@ async function nextJob(jobId, lastStatus) {
   } else if (lastStatus !== undefined) await sleep(750);
   // The first fallback check runs immediately, matching the original polling behaviour.
   // 后备轮询的第一次查询立即执行，与原有轮询行为一致。
+  if (activeGeneration !== generation) return null;
   const polled = await api("/jobs/" + jobId);
+  if (activeGeneration !== generation) return null;
   // Merge into the same cache so pushed and polled states share one forward-only view.
   // 合并到同一缓存，使推送与轮询的状态共享一个只进不退的视图。
   noteJob(polled, jobId);
@@ -213,6 +217,7 @@ function authExpired(current) {
   // stopStream also clears any pending history refresh retry.
   // stopStream 同时清除待执行的历史刷新重试。
   stopStream();
+  authorization = null;
   notice("Your session has expired. Please sign in again.");
   openLogin();
 }
@@ -616,7 +621,7 @@ function setSidebar(open) {
  * 离开已保存的会话前，将草稿与响应尚未确认的提交标识一同保存到页面内存。
  */
 function rememberDraft() {
-  if (!authorization || !conversation) return;
+  if (!conversation) return;
   drafts.set(conversation, { content: $("message").value, pending });
 }
 
@@ -630,12 +635,10 @@ function restoreDraft(id) {
   resizeComposer();
 }
 
-/** Open an empty composer while retaining a saved chat's in-memory draft for later return.
- * 打开空白会话输入框，同时保留原有会话的内存草稿，便于返回时继续处理。
+/** Open an empty composer and invalidate outstanding reads for the previous chat.
+ * 打开空白会话输入框，并使上一个会话尚未完成的读取失效。
  */
-function newChat() {
-  if (busy) return;
-  rememberDraft();
+function resetChat() {
   generation++;
   pending = null;
   conversation = null;
@@ -649,6 +652,29 @@ function newChat() {
   resizeComposer();
   if (matchMedia("(max-width: 640px)").matches) setSidebar(false);
   $("message").focus();
+}
+
+/** Start a new chat, retaining the previous chat's draft for this account.
+ * 开始新会话，并为当前账号保留上一个会话的草稿。
+ */
+function newChat() {
+  if (busy) return;
+  rememberDraft();
+  resetChat();
+}
+
+/** Discard the previous account's workspace, including during an in-flight send.
+ * 清除上一个账号的工作区，即使还有未完成的发送请求。
+ */
+function clearAccountWorkspace() {
+  conversations = [];
+  drafts.clear();
+  jobStates.clear();
+  resumeAfterLogin = false;
+  awaitingReply = false;
+  $("search").value = "";
+  setBusy(false);
+  resetChat();
 }
 
 /** Open saved history without discarding the current chat's uncertain submission.
@@ -693,8 +719,11 @@ $("login-form").addEventListener("submit", async event => {
   try {
     // Basic credentials stay in memory; remove the password from the form after validation.
     // Basic 认证信息只驻留内存；验证成功后立即从表单中移除明文密码。
-    authorization = "Basic " + btoa($("username").value + ":" + $("password").value);
-    const account = await api("/me");
+    const credentials = "Basic " + btoa($("username").value + ":" + $("password").value);
+    const account = await api("/me", undefined, credentials);
+    authorization = credentials;
+    if (accountId !== null && account.id !== accountId) clearAccountWorkspace();
+    accountId = account.id;
     $("password").value = "";
     $("account-name").textContent = account.display_name || account.username;
     $("account-action").textContent = "Sign out";
@@ -710,7 +739,6 @@ $("login-form").addEventListener("submit", async event => {
       $("message-form").requestSubmit();
     } else $("message").focus();
   } catch (error) {
-    authorization = null;
     notice(error.message, "login-error");
   } finally { $("login-submit").disabled = false; }
 });
@@ -728,16 +756,14 @@ loginPanel.addEventListener("close", () => {
 // 退出时先清除属于该账号的全部草稿，再回到未登录工作区，防止下个账号读取旧内容。
 $("new-chat").addEventListener("click", newChat);
 $("sign-out").addEventListener("click", () => {
-  if (!authorization) { openLogin(); return; }
+  if (!authorization && accountId === null) { openLogin(); return; }
   authorization = null;
-  conversations = [];
-  drafts.clear();
-  jobStates.clear();
+  accountId = null;
   $("account-name").textContent = "Your workspace";
   $("account-action").textContent = "Sign in to get started";
   $("sign-out").setAttribute("aria-label", "Sign in");
   $("avatar").textContent = "A";
-  newChat();
+  clearAccountWorkspace();
 });
 
 // Search filters loaded titles locally; sidebar controls preserve a usable keyboard focus.
@@ -814,6 +840,7 @@ $("message-form").addEventListener("submit", async event => {
       // 按 Unicode 码点截取标题，避免将 emoji 的代理对截成无法保存的半个字符。
       const title = Array.from(content.trim()).slice(0, 70).join("");
       const created = await api("/conversations", { title });
+      if (generation !== currentGeneration) return;
       conversation = created.id;
       $("chat-title").textContent = created.title;
       startStream();
@@ -825,9 +852,11 @@ $("message-form").addEventListener("submit", async event => {
     const receipt = await api("/conversations/" + conversation + "/messages", {
       content: pending.content, submission_key: pending.submission_key,
     });
+    if (generation !== currentGeneration) return;
     status("Queued", true);
     awaitingReply = true;
     await renderMessages(true);
+    if (generation !== currentGeneration) return;
     await listConversations();
     // Follow the durable job through pushed events, or by polling when live updates are unavailable.
     // A browser timeout leaves its retry identity available in memory.
@@ -836,6 +865,7 @@ $("message-form").addEventListener("submit", async event => {
     let lastStatus;
     while (Date.now() < deadline && generation === currentGeneration) {
       const job = await nextJob(receipt.job_id, lastStatus);
+      if (generation !== currentGeneration) return;
       lastStatus = job.status;
       status(job.status === "QUEUED" ? "Queued" : "Working", true);
       if (job.status === "FAILED") {
@@ -851,12 +881,13 @@ $("message-form").addEventListener("submit", async event => {
         $("message").value = "";
         status();
         await renderMessages();
-        await listConversations();
+        if (generation === currentGeneration) await listConversations();
         return;
       }
     }
     throw new Error("Still waiting. Send the same text again to check this job without duplicating it.");
   } catch (error) {
+    if (generation !== currentGeneration) return;
     // Keep the text and uncertain key on transport failures so retrying cannot duplicate work.
     // 传输失败时保留原文及待确认标识，避免重试创建重复消息或后台任务。
     awaitingReply = false;
@@ -865,10 +896,12 @@ $("message-form").addEventListener("submit", async event => {
     // Another tab may have paused this conversation with a newly saved proposal.
     // 另一标签页可能刚保存了方案，并因此暂停了当前会话。
     if (error.status === 409 && conversation) await renderMessages().catch(() => {});
-    notice(error.message);
+    if (generation === currentGeneration) notice(error.message);
   } finally {
-    setBusy(false);
-    $("message").focus();
+    if (generation === currentGeneration) {
+      setBusy(false);
+      $("message").focus();
+    }
   }
 });
 

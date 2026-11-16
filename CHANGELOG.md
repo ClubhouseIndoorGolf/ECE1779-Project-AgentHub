@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### 2026-11-15
+
+- **Account isolation after reauthentication.** Reauthenticating with the same account after an SSE-related `401` preserves the open conversation and its draft and restarts live updates. Signing in with another account clears the previous account's conversation, drafts, and pending submission state before loading the new account's workspace. Responses to earlier requests cannot update the new workspace. [Live updates guide](docs/LIVE_UPDATES.md#browser-client)
+
 ### 2026-11-14
 
 - **Live updates over SSE.** `GET /conversations/{id}/events` streams new messages, job status changes and proposal status changes for an owned conversation. `Last-Event-ID` replays messages after the given sequence, and each stream closes after five minutes so clients reconnect. The browser follows sends and approved continuations through pushed events, reconnects with backoff, and falls back to polling when no stream is live. The footer shows the connection state. No schema change. [Live updates guide](docs/LIVE_UPDATES.md)

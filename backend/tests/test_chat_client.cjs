@@ -569,21 +569,90 @@ test("a 401 stream asks for sign-in and resumes live updates after signing in", 
       if (opens === 1) return { ok: false, status: 401 };
       return sseResponse(options.signal).response;
     }
-    if (url === "/me") return response({ username: "alice" });
+    if (url === "/me") return response({ id: "alice-id", username: "alice" });
     if (url.includes("/messages?") || url === "/conversations") return response([]);
     throw new Error("Unexpected request: " + url);
   }, streamingGlobals);
-  t.after(() => client.run("newChat()"));
+  t.after(() => client.run("stopStream()"));
   client.element("login-panel").showModal = () => { loginOpened++; };
   client.element("login-panel").close = () => {};
-  await client.run("authorization = 'Basic stale'; openConversation({ id: 'chat-a', title: 'Chat A' })");
+  const login = client.element("login-form").listeners.get("submit");
+  client.element("username").value = "alice";
+  client.element("password").value = "old-password";
+  await login({ preventDefault() {} });
+  await client.run("openConversation({ id: 'chat-a', title: 'Chat A' })");
+  client.element("message").value = "Alice draft";
   await until(() => loginOpened === 1);
   await new Promise(resolve => setTimeout(resolve, 300));
   assert.equal(opens, 1);
 
-  client.element("username").value = "alice";
   client.element("password").value = "new-password";
-  await client.element("login-form").listeners.get("submit")({ preventDefault() {} });
+  await login({ preventDefault() {} });
   await until(() => opens === 2);
   assert.equal(client.element("notice").textContent, "");
+  assert.equal(client.element("chat-title").textContent, "Chat A");
+  assert.equal(client.element("message").value, "Alice draft");
+});
+
+test("signing in as another account after a 401 clears the old workspace during a send", async t => {
+  let stream, loginOpened = 0, streamOpens = 0, historyReads = 0, aliceJobPolls = 0;
+  let aliceSubmission;
+  const client = createClient(async (url, options) => {
+    const isBob = options.headers.Authorization === "Basic " + Buffer.from("bob:password").toString("base64");
+    if (url === "/me") return response(isBob ? { id: "bob-id", username: "bob" } : { id: "alice-id", username: "alice" });
+    if (url === "/conversations") return response(isBob ? [{ id: "chat-b", title: "Bob chat" }] : [{ id: "chat-a", title: "Alice chat" }]);
+    if (url === "/conversations/chat-a/events") {
+      streamOpens++;
+      stream = sseResponse(options.signal);
+      return stream.response;
+    }
+    if (url === "/conversations/chat-a/messages" && options.method === "POST") {
+      return new Promise(resolve => { aliceSubmission = resolve; });
+    }
+    if (url.startsWith("/conversations/chat-a/messages?")) {
+      historyReads++;
+      if (historyReads > 1) return { ok: false, status: 401 };
+      return response([{ seq: 1, role: "user", content: "Alice history" }]);
+    }
+    if (url === "/jobs/alice-job") {
+      aliceJobPolls++;
+      return response({ id: "alice-job", status: "SUCCEEDED" });
+    }
+    throw new Error("Unexpected request: " + url);
+  }, streamingGlobals);
+  t.after(() => {
+    client.run("stopStream()");
+    aliceSubmission?.(response({ job_id: "alice-job" }));
+  });
+  client.element("login-panel").showModal = () => { loginOpened++; };
+  client.element("login-panel").close = () => {};
+  const login = client.element("login-form").listeners.get("submit");
+  client.element("username").value = "alice";
+  client.element("password").value = "old-password";
+  await login({ preventDefault() {} });
+  await client.run("openConversation({ id: 'chat-a', title: 'Alice chat' })");
+  assert.equal(client.element("messages").children[0].children[1].textContent, "Alice history");
+  const sending = client.send("Alice draft");
+  await until(() => aliceSubmission);
+
+  stream.push('id: 1\nevent: ready\ndata: {"cursor":1}\n\n');
+  await until(() => loginOpened === 1);
+  client.element("username").value = "bob";
+  client.element("password").value = "password";
+  await login({ preventDefault() {} });
+  assert.equal(client.element("account-name").textContent, "bob");
+  assert.equal(client.element("conversations").children[0].textContent, "Bob chat");
+  assert.equal(client.element("chat-title").textContent, "New chat");
+  assert.equal(client.element("messages").children.length, 0);
+  assert.equal(client.element("message").value, "");
+  assert.equal(client.run("pending"), null);
+  assert.equal(client.run("busy"), false);
+  assert.equal(streamOpens, 1);
+
+  client.element("message").value = "Bob draft";
+  aliceSubmission(response({ job_id: "alice-job" }));
+  await sending;
+  assert.equal(client.element("message").value, "Bob draft");
+  assert.equal(client.element("notice").textContent, "");
+  assert.equal(aliceJobPolls, 0);
 });
