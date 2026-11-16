@@ -1,17 +1,17 @@
 # Live updates (Server-Sent Events)
 
-The browser receives conversation changes over a Server-Sent Events (SSE) stream instead of polling job status every 750 ms. Polling remains as an automatic fallback. This feature adds no schema change, migration or dependency.
+The browser receives conversation changes over a Server-Sent Events (SSE) stream, with polling as a fallback. The default stream uses message sequences. Clients can opt into durable replay of messages, approvals and execution events stored by migration `0007_conversation_events`.
 
 ## Endpoint
 
-`GET /conversations/{conversation_id}/events` returns `text/event-stream`.
+`GET /conversations/{conversation_id}/events` returns `text/event-stream`. The following cursor behavior applies to the default version.
 
 - **Authentication and ownership.** The endpoint uses HTTP Basic, like every other endpoint. It checks ownership once before streaming. An unknown conversation, or one owned by another account, returns `404`. Missing or invalid credentials return `401`.
 - **Resume cursor.** Send `Last-Event-ID: <seq>` with the last message sequence received. The stream replays later messages in order. Without the header, or with an invalid value, the stream starts at the conversation's current last message. The client loads earlier history through `GET /conversations/{id}/messages`.
 - **Lifetime.** Each stream closes after 300 seconds so load balancers can rebalance connections. The client then reconnects with `Last-Event-ID`. The stream sends a `: keepalive` comment after 15 seconds without events.
 - **Database use.** Every 0.5 seconds the stream reads committed rows in a short read-only session. It does not hold a database connection between reads. Tunables are module attributes in [events.py](../backend/app/events.py).
 
-## Events
+## Default stream events
 
 | Event | `id` | `data` |
 | :-- | :-- | :-- |
@@ -23,9 +23,19 @@ The browser receives conversation changes over a Server-Sent Events (SSE) stream
 
 Each connection tracks the state it has already sent, so it sends a job or proposal only when it changes. A reconnect resends current active jobs, so listeners should treat events as idempotent.
 
+## Durable event replay
+
+1. Read the first page of `GET /conversations/{id}/messages` with `after_seq=0` or without a cursor. The body remains a message list. The `X-Conversation-Event-Cursor` response header comes from the same database snapshot as the page. Use `after_seq` from the message sequence to load subsequent pages.
+2. Open `GET /conversations/{id}/events?version=2` with that header value as `Last-Event-ID`. On reconnect, send the ID of the last complete event frame. The server replays later events from PostgreSQL in sequence order. An explicit `v2:0` starts at the first recorded event.
+3. Retain the cursor per conversation. Deduplicate replayed frames by conversation ID and event sequence, and use the message and job endpoints to refresh current state.
+
+The version 2 endpoint returns `422` before streaming if the cursor is missing, malformed, a legacy numeric cursor, or ahead of the conversation's committed event head. Reload the history snapshot to obtain a valid cursor. Both versions check the same account ownership and use short database sessions.
+
+Each stored frame uses an event name such as `proposal.decided` and an ID such as `v2:42`. Its JSON contains `seq` (a decimal string), `type`, `conversation_id`, `created_at`, and the original `payload`. Supported types are `message.created`, `proposal.created`, `proposal.decided`, `job.status_changed`, `resolution.completed`, and `resolution.invalidated`. The connection confirmation, heartbeat, and error frames leave the cursor unchanged. Existing history remains available through the message endpoint. Durable replay covers events recorded after the migration and the installation of the event writers.
+
 ## Browser client
 
-[chat.js](../backend/app/static/chat.js) reads the stream with `fetch` and a body reader. It does not use `EventSource`, which cannot send the `Authorization` header.
+[chat.js](../backend/app/static/chat.js) currently reads the default stream with authenticated `fetch` and a body reader.
 
 - **Starting and stopping.** Opening or creating a conversation starts its stream. Starting a new chat or signing out closes it.
 - **Reconnection.** After a normal close, the client reconnects within 250 ms. After a failure, it backs off from 1 s to at most 15 s with jitter. A stream with no data for 45 seconds is treated as dropped. A `401` or `404` stops the stream without retrying.
@@ -38,7 +48,7 @@ Each connection tracks the state it has already sent, so it sends a job or propo
 
 Automated coverage:
 
-- [test_events.py](../backend/tests/test_events.py) covers ownership, the fresh cursor, `Last-Event-ID` replay, live job and reply events, and proposal approval progress.
+- [test_events.py](../backend/tests/test_events.py) covers ownership and legacy replay, plus the durable snapshot cursor, cursor validation, ordered page replay, and approval committed between the snapshot reads.
 - [test_chat_client.cjs](../backend/tests/test_chat_client.cjs) covers completing a send from a pushed job event without polling, parsing a frame split across chunks, reconnecting with `Last-Event-ID`, and the polling fallback after `404`. It also verifies draft retention after signing back in to the same account and workspace isolation when a different account signs in during an in-flight send.
 
 Manual check against the running stack, with credentials from your private `.env`:
