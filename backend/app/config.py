@@ -1,6 +1,7 @@
 # Load database and worker configuration from the container environment.
 # 从容器环境变量读取数据库与 worker 配置。
 
+import math
 import os
 
 from sqlalchemy import URL
@@ -25,6 +26,6 @@ def database_url() -> URL:
 # 在启动 worker 前拒绝无效的时间限制。
 def positive_number(name: str, default: str) -> float:
     value = float(os.getenv(name, default))
-    if value <= 0:
+    if not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be positive")
     return value

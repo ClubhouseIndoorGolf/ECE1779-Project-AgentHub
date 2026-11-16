@@ -4,6 +4,11 @@ Reviewed on November 15, 2026 against `main` at `506bc66`. Working branch:
 `feature/agent-execution-completion`. This is a repository assessment and proposed
 implementation sequence, not a claim that the remaining features are implemented.
 
+Implementation update: the subsequent work on this branch is described in
+[Agent execution and integration contract](AGENT_EXECUTION.md), with separate
+[evaluation evidence](evaluation/README.md). The assessment below preserves the
+original reviewed baseline; its verification counts refer to that earlier revision.
+
 ## Assessment
 
 The durable worker and deterministic refund workflow are already substantial.

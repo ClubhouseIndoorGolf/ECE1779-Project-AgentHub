@@ -74,6 +74,8 @@ class ProposalOut(BaseModel):
     decision: Literal["APPROVE", "REJECT"] | None = None
     decided_at: datetime | None = None
     resume_job_id: UUID | None = None
+    revalidated_at: datetime | None = None
+    invalidation_reason: str | None = None
 
 
 # Only the authenticated employee can supply a decision on the identified version.
@@ -124,5 +126,18 @@ class JobOut(BaseModel):
     status: Literal["QUEUED", "RUNNING", "SUCCEEDED", "FAILED"]
     attempts: int
     last_error: str | None
+    created_at: datetime
+    finished_at: datetime | None
+
+
+class AgentStepOut(BaseModel):
+    """Account-scoped durable progress; worker tokens and raw provider responses stay private.
+    按账号授权的持久进度，不公开 worker 令牌或提供商原始响应。
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+    seq: int
+    name: str
+    result: dict | None
     created_at: datetime
     finished_at: datetime | None

@@ -43,12 +43,21 @@ def append_final_reply(session: Session, conversation: Conversation, source_id: 
 
 
 def close_proposal(
-    session: Session, conversation: Conversation, execution: Execution, status: str, reply: str
+    session: Session,
+    conversation: Conversation,
+    execution: Execution,
+    status: str,
+    reply: str,
+    *,
+    reason: str | None = None,
 ):
     """Save a terminal proposal state and its final chat reply together.
     将方案终态和最终聊天回复一起保存。
     """
     execution.status = status
+    if status == "INVALIDATED":
+        execution.invalidation_reason = reason or "PROPOSAL_EXPIRED"
+        execution.revalidated_at = session.scalar(select(func.clock_timestamp()))
     append_final_reply(session, conversation, execution.source_message_id, reply)
 
 
@@ -168,27 +177,37 @@ def apply_approved_resolution(session: Session, job: Job, conversation: Conversa
             AppliedResolution.order_id == execution.requested_order_id
         )
     )
+    execution.revalidated_at = now
     if now >= proposal.expires_at:
         close_proposal(session, conversation, execution, "INVALIDATED", EXPIRED_REPLY)
         return
-    if (
-        order is None
-        or ticket is None
-        or decision.user_id != conversation.user_id
+    reason = None
+    if order is None or ticket is None:
+        reason = "FACTS_UNAVAILABLE"
+    elif (
+        decision.user_id != conversation.user_id
         or order.assigned_user_id != conversation.user_id
         or ticket.assigned_user_id != conversation.user_id
-        or ticket.order_id != order.id
-        or ticket.status != "OPEN"
-        or existing_refund is not None
-        or execution.policy_version != POLICY_VERSION
-        or order_facts(order) != proposal.expected_order_facts
     ):
+        reason = "OWNERSHIP_CHANGED"
+    elif ticket.order_id != order.id:
+        reason = "TICKET_ORDER_CHANGED"
+    elif ticket.status != "OPEN":
+        reason = "TICKET_CLOSED"
+    elif existing_refund is not None:
+        reason = "ALREADY_REFUNDED"
+    elif execution.policy_version != POLICY_VERSION:
+        reason = "POLICY_CHANGED"
+    elif order_facts(order) != proposal.expected_order_facts:
+        reason = "ORDER_CHANGED"
+    if reason:
         close_proposal(
             session,
             conversation,
             execution,
             "INVALIDATED",
             "The refund proposal no longer matches the ticket or order. Request a new proposal.",
+            reason=reason,
         )
         return
 
@@ -205,6 +224,7 @@ def apply_approved_resolution(session: Session, job: Job, conversation: Conversa
             execution,
             "INVALIDATED",
             "The order no longer qualifies for the approved refund. Request a new proposal.",
+            reason="ELIGIBILITY_CHANGED",
         )
         return
 

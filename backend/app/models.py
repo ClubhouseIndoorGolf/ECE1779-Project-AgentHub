@@ -138,6 +138,7 @@ class Job(Base):
         UniqueConstraint("source_message_id", "kind", name="uq_jobs_source_kind"),
         CheckConstraint("kind IN ('PROCESS_MESSAGE', 'RESUME_EXECUTION')", name="ck_jobs_kind"),
         CheckConstraint("attempts >= 0", name="ck_jobs_attempts"),
+        CheckConstraint("model_calls >= 0 AND tool_calls >= 0", name="ck_jobs_agent_budget"),
         CheckConstraint(
             "(status = 'QUEUED' AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL AND finished_at IS NULL) OR "
             "(status = 'RUNNING' AND lease_owner IS NOT NULL AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL AND started_at IS NOT NULL AND attempts >= 1 AND finished_at IS NULL) OR "
@@ -190,6 +191,34 @@ class Job(Base):
     # Ownership deadline checked using live database time.
     # 使用数据库实时时间检查的领取截止时间。
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Reservations survive worker death; human approval uses a separate job.
+    # 预算预留在 worker 退出后仍保留，人工审批使用独立待办。
+    model_calls: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    tool_calls: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    agent_deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AgentStep(Base):
+    __tablename__ = "agent_steps"
+    __table_args__ = (
+        CheckConstraint("seq > 0", name="ck_agent_steps_seq"),
+        CheckConstraint(
+            "name IN ('reply', 'ask_clarification', 'lookup_ticket', 'check_refund', 'prepare_refund')",
+            name="ck_agent_steps_name",
+        ),
+        CheckConstraint("jsonb_typeof(arguments) = 'object'", name="ck_agent_steps_arguments"),
+        CheckConstraint(
+            "(result IS NULL AND finished_at IS NULL) OR (result IS NOT NULL AND jsonb_typeof(result) = 'object' AND finished_at IS NOT NULL)",
+            name="ck_agent_steps_result",
+        ),
+    )
+    job_id: Mapped[UUID] = mapped_column(ForeignKey("jobs.id", ondelete="RESTRICT"), primary_key=True)
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(Text)
+    arguments: Mapped[dict] = mapped_column(JSONB)
+    result: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 # A synthetic order visible only to the assigned employee account.
@@ -270,6 +299,8 @@ class Execution(Base):
     policy_version: Mapped[str] = mapped_column(Text)
     checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(Text, server_default=text("'COMPLETED'"))
+    revalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    invalidation_reason: Mapped[str | None] = mapped_column(Text)
 
 
 # A frozen refund proposal linked to its supporting eligibility result.

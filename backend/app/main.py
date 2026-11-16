@@ -14,7 +14,16 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.db import engine, get_session
-from app.models import Conversation, Execution, Job, Message, ProposalDecision, ResolutionProposal, User
+from app.models import (
+    AgentStep,
+    Conversation,
+    Execution,
+    Job,
+    Message,
+    ProposalDecision,
+    ResolutionProposal,
+    User,
+)
 from app.resolution_workflow import (
     EXPIRED_REPLY,
     PROPOSAL_VERSION,
@@ -23,6 +32,7 @@ from app.resolution_workflow import (
     unfinished_turn_before,
 )
 from app.schemas import (
+    AgentStepOut,
     ConversationCreate,
     ConversationOut,
     JobOut,
@@ -252,6 +262,8 @@ def list_messages(
                 decision=decision.decision if decision else None,
                 decided_at=decision.decided_at if decision else None,
                 resume_job_id=decision.resume_job_id if decision else None,
+                revalidated_at=execution.revalidated_at,
+                invalidation_reason=execution.invalidation_reason,
             )
         history.append(result)
     return history
@@ -352,3 +364,22 @@ def get_job(job_id: UUID, user: User = Depends(current_user), session: Session =
     if not job:
         raise HTTPException(404, "Job not found")
     return job
+
+
+@app.get("/jobs/{job_id}/steps", response_model=list[AgentStepOut])
+def get_agent_steps(
+    job_id: UUID,
+    after_seq: int = Query(0, ge=0),
+    user: User = Depends(current_user),
+    session: Session = Depends(get_session),
+):
+    """Expose ordered saved progress after checking the same ownership as job reads.
+    按待办读取相同的归属规则，返回有序的已保存进度。
+    """
+    get_job(job_id, user, session)
+    return session.scalars(
+        select(AgentStep)
+        .where(AgentStep.job_id == job_id, AgentStep.seq > after_seq, AgentStep.finished_at.is_not(None))
+        .order_by(AgentStep.seq)
+        .limit(100)
+    ).all()
