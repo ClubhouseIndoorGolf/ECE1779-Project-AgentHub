@@ -84,7 +84,12 @@ are withheld, so a reconnecting consumer cannot skip their later completion.
 Completed steps remain immutable. Fixed-mode and approval jobs can return no
 steps; their status/history endpoints remain authoritative.
 
-The SSE owner can publish each completed row once using `(job_id, seq)` as the
+PR #6's SSE transport is integrated on this branch. REST and SSE share the proposal
+serializer in `history.py`, including revalidation time and invalidation reason.
+The stream currently carries message, job and proposal updates; individual tool
+steps remain available through the authenticated REST endpoint above.
+
+The SSE owner can later publish each completed row once using `(job_id, seq)` as the
 stable identity, replay after the cursor, and use existing job/history state for
 terminal status. This branch adds no competing SSE transport or UI event model.
 Step completion is durable progress, not proof of an applied refund. The proposal
@@ -131,4 +136,4 @@ later turn. They do not simulate loss of the PostgreSQL server itself.
 See [evaluation instructions and evidence](evaluation/README.md). Deterministic
 execution and synthetic scaling results must be reported separately from live
 model tool selection and draft quality. Cloud deployment, live model acceptance,
-SSE/UI integration and team schema review remain integration work.
+tool-step SSE/UI integration and team schema review remain integration work.

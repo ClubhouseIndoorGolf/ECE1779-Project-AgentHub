@@ -6,14 +6,17 @@ import os
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.db import engine, get_session
+from app.db import SessionLocal, engine, get_session
+from app.events import ConversationStream, conversation_events, parse_last_event_id
+from app.history import read_history
 from app.models import (
     AgentStep,
     Conversation,
@@ -40,7 +43,6 @@ from app.schemas import (
     MessageOut,
     ProposalDecisionIn,
     ProposalDecisionOut,
-    ProposalOut,
     SubmissionOut,
 )
 from app.security import current_user
@@ -227,46 +229,53 @@ def list_messages(
     )
     if not conversation:
         raise HTTPException(404, "Conversation not found")
-    # Read each message, proposal, decision and job in the same snapshot without multiplying rows.
-    # 在同一快照中读取消息、方案、决定与待办，保持每条消息只返回一次。
-    rows = session.execute(
-        select(Message, Execution, ResolutionProposal, ProposalDecision, Job)
-        .outerjoin(Execution, Execution.source_message_id == Message.id)
-        .outerjoin(ResolutionProposal, ResolutionProposal.execution_id == Execution.id)
-        .outerjoin(ProposalDecision, ProposalDecision.proposal_id == ResolutionProposal.id)
-        .outerjoin(Job, Job.id == ProposalDecision.resume_job_id)
-        .where(Message.conversation_id == conversation_id, Message.seq > after_seq)
-        .order_by(Message.seq)
-        .limit(limit)
-    )
-    history = []
-    for message, execution, proposal, decision, job in rows:
-        result = MessageOut.model_validate(message)
-        # Keep ordinary history in its original shape and expose only public proposal fields.
-        # 保留普通历史原有的结构，并只返回方案的公开字段。
-        if proposal is not None:
-            result.proposal = ProposalOut(
-                id=proposal.id,
-                version=PROPOSAL_VERSION,
-                status=job.status if execution.status == "APPROVED" else execution.status,
-                ticket_id=str(proposal.ticket_id),
-                order_id=str(execution.requested_order_id),
-                refund_amount_minor=str(execution.refund_amount_minor),
-                currency=execution.currency,
-                customer_reply=proposal.customer_reply,
-                proposed_ticket_status=proposal.proposed_ticket_status,
-                policy_version=execution.policy_version,
-                delivered_at=proposal.expected_order_facts["delivered_at"],
-                checked_at=execution.checked_at,
-                expires_at=proposal.expires_at,
-                decision=decision.decision if decision else None,
-                decided_at=decision.decided_at if decision else None,
-                resume_job_id=decision.resume_job_id if decision else None,
-                revalidated_at=execution.revalidated_at,
-                invalidation_reason=execution.invalidation_reason,
+    # Read messages and any attached proposals in one snapshot; the event stream shares this shape.
+    # 在同一快照中读取消息及其附带方案；实时事件流复用相同的数据结构。
+    return read_history(session, conversation_id, after_seq, limit)
+
+
+# Check ownership once, then stream committed changes for that conversation.
+# 先检查一次会话归属，再推送该会话中已提交的变化。
+@app.get(
+    "/conversations/{conversation_id}/events",
+    response_class=StreamingResponse,
+    responses={200: {"content": {"text/event-stream": {}}}},
+    description=(
+        "Stream your conversation's new messages, job status changes and proposal status changes as "
+        "Server-Sent Events. Send Last-Event-ID with the last message sequence received to replay later messages."
+    ),
+)
+async def stream_events(
+    conversation_id: UUID,
+    request: Request,
+    last_event_id: str | None = Header(None, alias="Last-Event-ID"),
+    user: User = Depends(current_user),
+):
+    """Authorize the stream in a short session; each poll later opens its own read-only session.
+    在短会话中完成授权；之后每次轮询各自打开只读会话，流期间不长期占用数据库连接。
+    """
+
+    def owned() -> bool:
+        with SessionLocal() as session:
+            return (
+                session.scalar(
+                    select(Conversation.id).where(
+                        Conversation.id == conversation_id, Conversation.user_id == user.id
+                    )
+                )
+                is not None
             )
-        history.append(result)
-    return history
+
+    if not await run_in_threadpool(owned):
+        raise HTTPException(404, "Conversation not found")
+    stream = ConversationStream(conversation_id, parse_last_event_id(last_event_id))
+    return StreamingResponse(
+        conversation_events(stream, request.is_disconnected),
+        media_type="text/event-stream",
+        # Disable caching and proxy buffering so each frame reaches the browser promptly.
+        # 禁用缓存与代理缓冲，使每个事件帧及时到达浏览器。
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/proposals/{proposal_id}/decision", response_model=ProposalDecisionOut)

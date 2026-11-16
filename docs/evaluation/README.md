@@ -80,3 +80,27 @@ claims; the saved benchmark is local synthetic evidence, not a production result
 The suite also reports an upstream FastAPI/Starlette `TestClient` deprecation
 warning about HTTPX; it does not fail these tests. No dependency upgrade was made
 as part of the execution work.
+
+## Integration with main's SSE release
+
+Merged `origin/main` at `3d5bf59` (PR #6) into
+`feature/agent-execution-completion`. The shared history serializer now carries
+the agent's revalidation fields for both REST and SSE. Agent tool checkpoints and
+the authenticated steps endpoint remain intact; no migration collision occurred.
+
+Fresh merged-source checks: **157 backend tests passed**, **20 browser tests
+passed**, Ruff lint/format passed (38 Python files), Compose configuration and
+image builds passed, and the running API/worker duplicate-submission smoke passed.
+A real HTTP SSE stream also replayed the user message and delivered the worker's
+assistant message and successful job event. Added regressions verify that agent
+proposal completion and stale-approval invalidation match REST, live events and
+replay, including the revalidation timestamp and reason.
+
+Earlier integration runs encountered the already observed immediate-claim timing
+issue and an SSE test timer race. SSE tests now establish the stream baseline
+explicitly before committing worker results and poll for expected work with a
+bounded wait. Production scheduling, lease checks and stream behavior were not
+relaxed. The final complete run passed; the local clock caveat above still applies.
+The earlier benchmark artifact remains tied to its recorded implementation
+revision and was not relabeled as a new benchmark. No live provider calls or cloud
+deployment were performed during this merge.

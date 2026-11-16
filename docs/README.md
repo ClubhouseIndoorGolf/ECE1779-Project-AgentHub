@@ -15,6 +15,6 @@ The [repository README](../README.md) is the English entry point for reviewers a
 | [Architecture and team handover](AGENTHUB_TEAM_HANDOVER.md) | Original English architecture proposal; planned features are not claims of implementation |
 | [Developer documentation](developer/README.md) | Index of Chinese team explanations and historical specification drafts |
 
-The current implementation provides durable chat submission and a simulated refund workflow with human approval, using fixed commands or opt-in OpenAI tool selection. See [Worker baseline](WORKER_BASELINE.md) for setup and [Agent execution](AGENT_EXECUTION.md) for limits and recovery. SSE and production cloud delivery remain separate integration work.
+The current implementation provides durable chat submission and a simulated refund workflow with human approval, using fixed commands or opt-in OpenAI tool selection. See [Worker baseline](WORKER_BASELINE.md) for setup and [Agent execution](AGENT_EXECUTION.md) for limits and recovery. [Live updates](LIVE_UPDATES.md) stream conversation changes over SSE. Production cloud delivery remains separate integration work.
 
 Reviewer-facing documentation and system-generated runtime text are English. Source comments use English and Chinese. Chinese prose documents belong under `docs/developer/zh-CN/`; user-submitted Unicode content is preserved.
