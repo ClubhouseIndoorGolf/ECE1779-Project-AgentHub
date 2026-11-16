@@ -7,8 +7,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>AgentHub</title>
-  <link rel="stylesheet" href="/static/style.css?v=refund-approval">
-  <script src="/static/chat.js?v=refund-approval" defer></script>
+  <link rel="stylesheet" href="/static/style.css?v=live-updates-3">
+  <script src="/static/chat.js?v=live-updates-4" defer></script>
 </head>
 <body>
   <!-- Reuse inline SVG symbols for controls without external icon fonts or image requests.
@@ -46,8 +46,9 @@
       <div class="sidebar-footer"><div class="workspace-label"><span class="workspace-dot"></span>Personal workspace</div><button id="sign-out" class="account-button"><span id="avatar" class="avatar">A</span><span class="account-copy"><strong id="account-name">Your workspace</strong><span id="account-action">Sign in to get started</span></span><svg><use href="#i-chevron"/></svg></button></div>
     </aside>
     <main id="chat" class="chat">
-      <!-- Mode is configured server state; job status comes from polling the persisted job.
-           模式标签表示服务端配置；任务状态通过查询已持久化的后台任务获得。 -->
+      <!-- Mode is configured server state; job status is pushed over the conversation event stream,
+           with polling of the persisted job as the fallback.
+           模式标签表示服务端配置；任务状态通过会话事件流推送，并以查询已持久化任务作为后备。 -->
       <header class="topbar"><div class="thread-heading"><button id="sidebar-toggle" class="icon-button" aria-label="Toggle sidebar" aria-expanded="true"><svg><use href="#i-panel"/></svg></button><svg class="thread-icon"><use href="#i-chat"/></svg><h1 id="chat-title">New chat</h1></div><div class="topbar-actions"><span id="job-status" class="job-status" role="status"></span><span id="mode" class="mode-badge">Connecting</span><button id="theme-toggle" class="icon-button" aria-label="Switch to dark theme" title="Change appearance"><svg><use href="#i-sun"/></svg></button></div></header>
       <div class="chat-body">
         <!-- Empty and populated states share one composer; CSS switches the welcome view.

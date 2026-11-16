@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### 2026-11-15
+
+- **Account isolation after reauthentication.** Reauthenticating with the same account after an SSE-related `401` preserves the open conversation and its draft and restarts live updates. Signing in with another account clears the previous account's conversation, drafts, and pending submission state before loading the new account's workspace. Responses to earlier requests cannot update the new workspace. [Live updates guide](docs/LIVE_UPDATES.md#browser-client)
+
+### 2026-11-14
+
+- **Live updates over SSE.** `GET /conversations/{id}/events` streams new messages, job status changes and proposal status changes for an owned conversation. `Last-Event-ID` replays messages after the given sequence, and each stream closes after five minutes so clients reconnect. The browser follows sends and approved continuations through pushed events, reconnects with backoff, and falls back to polling when no stream is live. The footer shows the connection state. No schema change. [Live updates guide](docs/LIVE_UPDATES.md)
+- **Live update review fixes.** A history refresh triggered by a pushed event retries with backoff after a failed read. Polled and pushed job states share one cache that never moves backwards, including across retries. A `Last-Event-ID` with non-ASCII digits, such as `²`, starts a fresh stream instead of returning HTTP 500.
+- **Expired credentials during live updates.** A 401 from the event stream or from a history refresh it triggered stops live updates and pending refresh retries, keeps the draft, and asks the user to sign in again. Signing in resumes the stream for the open conversation. Other non-retryable client errors stop refresh retries and show the error. Transient 5xx and 429 responses still back off.
+
 ### 2026-11-11
 
 - **Ticket lookup** (`d3b49fa`). Fixed mode can look up a simulated support ticket and check the linked order's refund eligibility. Ticket and order access are checked separately. Migration `0004_read_only_ticket_lookup` adds tickets, and `seed-demo-tickets` adds sample tickets and their orders.

@@ -7,6 +7,7 @@
  */
 const $ = id => document.getElementById(id);
 let authorization = null;
+let accountId = null;
 let conversation = null;
 let busy = false;
 let generation = 0;
@@ -17,6 +18,17 @@ let resumeAfterLogin = false;
 const drafts = new Map();
 const pendingDecisions = new Set();
 const watchedResolutions = new Set();
+// Live updates: the latest streamed job states, their waiters, and the open conversation stream.
+// 实时更新：最近推送的任务状态、等待这些状态的回调，以及当前会话的事件流。
+const jobStates = new Map();
+const jobWaiters = new Map();
+let stream = null;
+let refreshTimer = null;
+let awaitingReply = false;
+// Streaming needs fetch body streams; older or test environments fall back to polling.
+// 实时流依赖 fetch 响应体流；不支持的旧环境或测试环境自动退回轮询。
+const streamingSupported = typeof AbortController === "function" && typeof TextDecoderStream === "function";
+const STREAM_IDLE_MS = 45000;
 
 /** Wait between job polls without blocking other browser interactions.
  * 在两次任务查询之间异步等待，不阻塞浏览器的其他交互。
@@ -26,10 +38,10 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 /** Call an authenticated same-origin endpoint with a bounded request timeout.
  * 携带内存中的认证信息调用同源接口，并限制单次请求的等待时间。
  */
-async function api(path, body) {
+async function api(path, body, credentials = authorization) {
   const response = await fetch(path, {
     method: body === undefined ? "GET" : "POST",
-    headers: { Authorization: authorization, "Content-Type": "application/json" },
+    headers: { Authorization: credentials, "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
     cache: "no-store",
     signal: AbortSignal.timeout(15000),
@@ -83,6 +95,261 @@ function status(text = "", working = false) {
   $("job-status").classList.toggle("working", working);
 }
 
+/** Show the live-update connection state in the footer.
+ * 在页脚显示实时更新连接状态。
+ */
+function connection(state = "") {
+  // Keep the health check's offline notice until the page reloads.
+  // 健康检查判定离线后保留离线提示，直到页面重新加载。
+  if ($("mode").classList.contains("offline")) return;
+  $("connection-label").textContent = { live: "Live updates", reconnecting: "Reconnecting…" }[state] || "Local workspace";
+  const footer = $("connection-label").parentElement;
+  footer?.classList?.toggle("live", state === "live");
+  footer?.classList?.toggle("reconnecting", state === "reconnecting");
+}
+
+/** Order job states along the worker's lifecycle; each claim increments attempts.
+ * QUEUED(n) = 2n, RUNNING(n) = 2n - 1, terminal states last, so a retry still moves forward.
+ * 按 Worker 生命周期给任务状态排序；每次领取都会增加 attempts，因此重试后的状态仍然向前推进。
+ */
+function jobProgress(job) {
+  if (job.status === "SUCCEEDED" || job.status === "FAILED") return Infinity;
+  const attempts = Number(job.attempts) || 0;
+  return job.status === "RUNNING" ? 2 * attempts - 1 : 2 * attempts;
+}
+
+/** Record a pushed or polled job state, ignoring older states, and wake its waiters.
+ * 记录推送或轮询得到的任务状态，忽略较旧的状态，并唤醒等待该任务的调用方。
+ */
+function noteJob(job, jobId = job.id) {
+  const known = jobStates.get(jobId);
+  // A delayed response or stale cache entry must never move the displayed state backwards.
+  // 延迟到达的响应或旧缓存不能让界面显示的状态倒退。
+  if (known && jobProgress(known) > jobProgress(job)) return;
+  jobStates.set(jobId, job);
+  for (const wake of [...(jobWaiters.get(jobId) || [])]) wake(job);
+}
+
+/** Resolve with the next streamed state of one job, or null after a timeout.
+ * 等待某个任务的下一次推送状态；超时则返回 null。
+ */
+function waitForJobEvent(jobId, ms) {
+  return new Promise(resolve => {
+    const waiters = jobWaiters.get(jobId) || new Set();
+    jobWaiters.set(jobId, waiters);
+    const done = job => {
+      clearTimeout(timer);
+      waiters.delete(done);
+      if (!waiters.size) jobWaiters.delete(jobId);
+      resolve(job);
+    };
+    const timer = setTimeout(() => done(null), ms);
+    waiters.add(done);
+  });
+}
+
+/** Return the next job state: pushed by the live stream when connected, otherwise polled.
+ * 获取任务的下一个状态：实时流连接时由服务端推送，否则退回 REST 轮询。
+ */
+async function nextJob(jobId, lastStatus) {
+  const activeGeneration = generation;
+  const known = jobStates.get(jobId);
+  if (known && known.status !== lastStatus) return known;
+  if (streamLive()) {
+    // A silent stream still gets a periodic REST confirmation, so a missed event cannot stall the page.
+    // 即使实时流长时间无事件，也会定期用 REST 确认，避免漏掉事件导致页面停滞。
+    const pushed = await waitForJobEvent(jobId, 5000);
+    if (pushed) return pushed;
+  } else if (lastStatus !== undefined) await sleep(750);
+  // The first fallback check runs immediately, matching the original polling behaviour.
+  // 后备轮询的第一次查询立即执行，与原有轮询行为一致。
+  if (activeGeneration !== generation) return null;
+  const polled = await api("/jobs/" + jobId);
+  if (activeGeneration !== generation) return null;
+  // Merge into the same cache so pushed and polled states share one forward-only view.
+  // 合并到同一缓存，使推送与轮询的状态共享一个只进不退的视图。
+  noteJob(polled, jobId);
+  return jobStates.get(jobId);
+}
+
+/** Report whether the open conversation currently receives pushed updates.
+ * 判断当前打开的会话是否正在接收服务端推送。
+ */
+function streamLive() {
+  return Boolean(stream?.live && stream.conversation === conversation);
+}
+
+/** Refresh history once after a burst of pushed changes, reusing the stale-read guards.
+ * A failed read retries with backoff, because a live stream may send only heartbeats afterwards.
+ * 一批推送变化到达后只刷新一次历史，并复用防止旧响应覆盖的保护逻辑。
+ * 读取失败时按退避重试，因为之后实时流可能只发送心跳，不会再触发刷新。
+ */
+function scheduleRefresh(delay = 150, attempt = 0) {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(async () => {
+    const current = stream;
+    if (!current || current.conversation !== conversation) return;
+    try {
+      await renderMessages(awaitingReply);
+    } catch (error) {
+      if (stream !== current || current.conversation !== conversation) return;
+      // Rejected credentials need a new sign-in; retrying would only repeat the 401 every 10 seconds.
+      // 凭据被拒绝时需要重新登录；继续重试只会每 10 秒重复收到 401。
+      if (error.status === 401) { authExpired(current); return; }
+      // Other client errors will not succeed on retry; transient 5xx, 429 and network errors back off.
+      // 其他客户端错误重试也不会成功；临时的 5xx、429 与网络错误按退避重试。
+      if (error.status >= 400 && error.status < 500 && error.status !== 429) { notice(error.message); return; }
+      // A newer event or navigation cancels this retry through clearTimeout or the stream check.
+      // 新事件或会话切换会通过 clearTimeout 或事件流检查取消本次重试。
+      scheduleRefresh(Math.min(1000 * 2 ** attempt, 10000), attempt + 1);
+      return;
+    }
+    listConversations().catch(() => {});
+  }, delay);
+}
+
+/** Stop live updates after rejected credentials and ask the user to sign in again.
+ * The draft and conversation stay in memory; a successful sign-in restarts the stream.
+ * 凭据被拒绝后停止实时更新，并提示用户重新登录；草稿与当前会话保留在内存中，登录成功后重新连接。
+ */
+function authExpired(current) {
+  if (stream !== current) return;
+  // stopStream also clears any pending history refresh retry.
+  // stopStream 同时清除待执行的历史刷新重试。
+  stopStream();
+  authorization = null;
+  notice("Your session has expired. Please sign in again.");
+  openLogin();
+}
+
+/** Close the current stream; navigation and sign-out must not keep old account data flowing.
+ * 关闭当前事件流；切换会话或退出登录后不能继续接收旧账号的数据。
+ */
+function stopStream() {
+  if (stream) stream.controller.abort();
+  stream = null;
+  clearTimeout(refreshTimer);
+  connection();
+}
+
+/** Open a stream for the current conversation unless one is already serving it.
+ * 为当前会话打开事件流；若已有同一会话和账号的流在运行则保持不变。
+ */
+function startStream() {
+  if (stream && stream.conversation === conversation && stream.authorization === authorization) return;
+  stopStream();
+  if (!streamingSupported || !authorization || !conversation) return;
+  const current = { conversation, authorization, controller: new AbortController(), live: false, lastSeq: null };
+  stream = current;
+  runStream(current);
+}
+
+/** Keep one conversation stream connected, resuming from the last message sequence after drops.
+ * 保持单个会话事件流连接；断线后从最后收到的消息顺序号续传。
+ */
+async function runStream(current) {
+  let delay = 1000;
+  while (stream === current) {
+    let failed = false;
+    // Each attempt has its own abort so an idle connection can be dropped without stopping the stream.
+    // 每次连接使用独立的中止控制，空闲超时只断开本次连接，不结束整个实时流。
+    const attempt = new AbortController();
+    const stop = () => attempt.abort();
+    current.controller.signal.addEventListener("abort", stop);
+    let idle = setTimeout(stop, STREAM_IDLE_MS);
+    try {
+      const headers = { Authorization: current.authorization };
+      if (current.lastSeq !== null) headers["Last-Event-ID"] = String(current.lastSeq);
+      const response = await fetch("/conversations/" + current.conversation + "/events", {
+        headers, cache: "no-store", signal: attempt.signal,
+      });
+      if (response.status === 401) { authExpired(current); return; }
+      if (response.status === 404) {
+        // Ownership changed; polling remains available and reports the error.
+        // 会话归属已变化；保留轮询路径，由普通请求显示错误。
+        if (stream === current) { current.live = false; connection(); }
+        return;
+      }
+      if (!response.ok || !response.body) throw new Error("Live updates unavailable (" + response.status + ")");
+      await readEvents(response.body, frame => {
+        clearTimeout(idle);
+        idle = setTimeout(stop, STREAM_IDLE_MS);
+        if (handleFrame(current, frame) === false) failed = true;
+      });
+      if (!current.live) failed = true;
+    } catch {
+      failed = true;
+    } finally {
+      clearTimeout(idle);
+      current.controller.signal.removeEventListener("abort", stop);
+    }
+    if (stream !== current) return;
+    current.live = false;
+    connection("reconnecting");
+    // A normal server-side close reconnects quickly; failures back off with jitter.
+    // 服务端正常关闭时快速重连；失败时按带抖动的指数退避重试。
+    if (failed) {
+      await sleep(delay + Math.random() * 500);
+      delay = Math.min(delay * 2, 15000);
+    } else {
+      delay = 1000;
+      await sleep(250);
+    }
+  }
+}
+
+/** Parse the SSE subset the server sends: event, id and single-line JSON data fields.
+ * 解析服务端使用的 SSE 子集：event、id 以及单行 JSON 的 data 字段。
+ */
+async function readEvents(body, onFrame) {
+  const reader = body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) return;
+    buffer += value;
+    let end;
+    while ((end = buffer.indexOf("\n\n")) >= 0) {
+      const block = buffer.slice(0, end);
+      buffer = buffer.slice(end + 2);
+      const frame = { event: "message", id: null, data: [] };
+      for (const line of block.split("\n")) {
+        // Comment lines are heartbeats; they only reset the idle timer.
+        // 注释行是心跳，只用于重置空闲计时。
+        if (!line || line.startsWith(":")) { if (line) onFrame(null); continue; }
+        const colon = line.indexOf(":");
+        const field = colon < 0 ? line : line.slice(0, colon);
+        let text = colon < 0 ? "" : line.slice(colon + 1);
+        if (text.startsWith(" ")) text = text.slice(1);
+        if (field === "event") frame.event = text;
+        else if (field === "id") frame.id = text;
+        else if (field === "data") frame.data.push(text);
+      }
+      if (frame.data.length) onFrame({ ...frame, data: frame.data.join("\n") });
+    }
+  }
+}
+
+/** Apply one pushed frame; returns false when the server reported a failure.
+ * 处理单个推送帧；服务端报告故障时返回 false。
+ */
+function handleFrame(current, frame) {
+  if (!frame || stream !== current) return true;
+  let data;
+  try { data = JSON.parse(frame.data); } catch { return true; }
+  if (frame.id !== null && /^\d+$/.test(frame.id)) current.lastSeq = Number(frame.id);
+  if (frame.event === "ready") {
+    current.live = true;
+    connection("live");
+    // Catch up on anything committed between the last history read and this connection.
+    // 补齐上次读取历史之后、本次连接建立之前提交的变化。
+    scheduleRefresh();
+  } else if (frame.event === "job") noteJob(data);
+  else if (frame.event === "message" || frame.event === "proposal") scheduleRefresh();
+  else if (frame.event === "error") return false;
+  return true;
+}
+
 /** Save a decision, then refresh the card only if its conversation is still open.
  * 保存审批决定；仅在其会话仍处于打开状态时刷新方案卡片。
  */
@@ -130,10 +397,10 @@ async function watchResolution(proposal) {
     const deadline = Date.now() + 180000;
     let lastStatus = proposal.status;
     while (generation === activeGeneration && Date.now() < deadline) {
-      await sleep(750);
-      if (generation !== activeGeneration) return;
       try {
-        const job = await api("/jobs/" + proposal.resume_job_id);
+        // Pushed job events arrive immediately; polling is only the fallback.
+        // 推送的任务事件会立即到达；轮询仅作为后备方案。
+        const job = await nextJob(proposal.resume_job_id, lastStatus);
         if (generation !== activeGeneration) return;
         if (job.status !== lastStatus) await renderMessages(busy);
         if (job.status === "SUCCEEDED" || job.status === "FAILED") return;
@@ -142,6 +409,7 @@ async function watchResolution(proposal) {
         // Brief network or server failures should not hide a later terminal result.
         // 短暂网络或服务端故障不应让后续终态无法显示。
         if (error.status && error.status < 500 && error.status !== 429) throw error;
+        await sleep(750);
       }
     }
     if (generation === activeGeneration) {
@@ -353,7 +621,7 @@ function setSidebar(open) {
  * 离开已保存的会话前，将草稿与响应尚未确认的提交标识一同保存到页面内存。
  */
 function rememberDraft() {
-  if (!authorization || !conversation) return;
+  if (!conversation) return;
   drafts.set(conversation, { content: $("message").value, pending });
 }
 
@@ -367,15 +635,14 @@ function restoreDraft(id) {
   resizeComposer();
 }
 
-/** Open an empty composer while retaining a saved chat's in-memory draft for later return.
- * 打开空白会话输入框，同时保留原有会话的内存草稿，便于返回时继续处理。
+/** Open an empty composer and invalidate outstanding reads for the previous chat.
+ * 打开空白会话输入框，并使上一个会话尚未完成的读取失效。
  */
-function newChat() {
-  if (busy) return;
-  rememberDraft();
+function resetChat() {
   generation++;
   pending = null;
   conversation = null;
+  stopStream();
   $("chat-title").textContent = "New chat";
   $("message").value = "";
   showMessages([]);
@@ -385,6 +652,29 @@ function newChat() {
   resizeComposer();
   if (matchMedia("(max-width: 640px)").matches) setSidebar(false);
   $("message").focus();
+}
+
+/** Start a new chat, retaining the previous chat's draft for this account.
+ * 开始新会话，并为当前账号保留上一个会话的草稿。
+ */
+function newChat() {
+  if (busy) return;
+  rememberDraft();
+  resetChat();
+}
+
+/** Discard the previous account's workspace, including during an in-flight send.
+ * 清除上一个账号的工作区，即使还有未完成的发送请求。
+ */
+function clearAccountWorkspace() {
+  conversations = [];
+  drafts.clear();
+  jobStates.clear();
+  resumeAfterLogin = false;
+  awaitingReply = false;
+  $("search").value = "";
+  setBusy(false);
+  resetChat();
 }
 
 /** Open saved history without discarding the current chat's uncertain submission.
@@ -403,6 +693,7 @@ async function openConversation(row) {
   }
   generation++;
   conversation = row.id;
+  startStream();
   $("chat-title").textContent = row.title;
   status();
   notice();
@@ -428,8 +719,11 @@ $("login-form").addEventListener("submit", async event => {
   try {
     // Basic credentials stay in memory; remove the password from the form after validation.
     // Basic 认证信息只驻留内存；验证成功后立即从表单中移除明文密码。
-    authorization = "Basic " + btoa($("username").value + ":" + $("password").value);
-    const account = await api("/me");
+    const credentials = "Basic " + btoa($("username").value + ":" + $("password").value);
+    const account = await api("/me", undefined, credentials);
+    authorization = credentials;
+    if (accountId !== null && account.id !== accountId) clearAccountWorkspace();
+    accountId = account.id;
     $("password").value = "";
     $("account-name").textContent = account.display_name || account.username;
     $("account-action").textContent = "Sign out";
@@ -437,12 +731,14 @@ $("login-form").addEventListener("submit", async event => {
     $("avatar").textContent = (account.display_name || account.username).slice(0, 2).toUpperCase();
     await listConversations();
     $("login-panel").close();
+    // Resume live updates for a conversation left open when the previous session expired.
+    // 若上次会话过期时仍打开着某个会话，登录后恢复其实时更新。
+    if (conversation) { notice(); startStream(); }
     if (resumeAfterLogin) {
       resumeAfterLogin = false;
       $("message-form").requestSubmit();
     } else $("message").focus();
   } catch (error) {
-    authorization = null;
     notice(error.message, "login-error");
   } finally { $("login-submit").disabled = false; }
 });
@@ -460,15 +756,14 @@ loginPanel.addEventListener("close", () => {
 // 退出时先清除属于该账号的全部草稿，再回到未登录工作区，防止下个账号读取旧内容。
 $("new-chat").addEventListener("click", newChat);
 $("sign-out").addEventListener("click", () => {
-  if (!authorization) { openLogin(); return; }
+  if (!authorization && accountId === null) { openLogin(); return; }
   authorization = null;
-  conversations = [];
-  drafts.clear();
+  accountId = null;
   $("account-name").textContent = "Your workspace";
   $("account-action").textContent = "Sign in to get started";
   $("sign-out").setAttribute("aria-label", "Sign in");
   $("avatar").textContent = "A";
-  newChat();
+  clearAccountWorkspace();
 });
 
 // Search filters loaded titles locally; sidebar controls preserve a usable keyboard focus.
@@ -545,8 +840,10 @@ $("message-form").addEventListener("submit", async event => {
       // 按 Unicode 码点截取标题，避免将 emoji 的代理对截成无法保存的半个字符。
       const title = Array.from(content.trim()).slice(0, 70).join("");
       const created = await api("/conversations", { title });
+      if (generation !== currentGeneration) return;
       conversation = created.id;
       $("chat-title").textContent = created.title;
+      startStream();
     }
     // A network retry retains the logical submission key.
     // 网络错误导致是否接受未知时，重试必须沿用相同的逻辑提交标识。
@@ -555,44 +852,56 @@ $("message-form").addEventListener("submit", async event => {
     const receipt = await api("/conversations/" + conversation + "/messages", {
       content: pending.content, submission_key: pending.submission_key,
     });
+    if (generation !== currentGeneration) return;
     status("Queued", true);
+    awaitingReply = true;
     await renderMessages(true);
+    if (generation !== currentGeneration) return;
     await listConversations();
-    // Poll the durable job; a browser timeout leaves its retry identity available in memory.
-    // 查询持久任务状态；浏览器等待超时后仍在内存保留标识，以便继续确认同一任务。
+    // Follow the durable job through pushed events, or by polling when live updates are unavailable.
+    // A browser timeout leaves its retry identity available in memory.
+    // 通过推送事件跟踪持久任务，实时更新不可用时退回轮询；浏览器等待超时后仍在内存保留标识。
     const deadline = Date.now() + 180000;
+    let lastStatus;
     while (Date.now() < deadline && generation === currentGeneration) {
-      const job = await api("/jobs/" + receipt.job_id);
+      const job = await nextJob(receipt.job_id, lastStatus);
+      if (generation !== currentGeneration) return;
+      lastStatus = job.status;
       status(job.status === "QUEUED" ? "Queued" : "Working", true);
       if (job.status === "FAILED") {
+        awaitingReply = false;
         pending = null;
         status("Failed");
         throw new Error(job.last_error || "The reply could not be completed.");
       }
       if (job.status === "SUCCEEDED") {
+        awaitingReply = false;
         pending = null;
         drafts.delete(conversation);
         $("message").value = "";
         status();
         await renderMessages();
-        await listConversations();
+        if (generation === currentGeneration) await listConversations();
         return;
       }
-      await sleep(750);
     }
     throw new Error("Still waiting. Send the same text again to check this job without duplicating it.");
   } catch (error) {
+    if (generation !== currentGeneration) return;
     // Keep the text and uncertain key on transport failures so retrying cannot duplicate work.
     // 传输失败时保留原文及待确认标识，避免重试创建重复消息或后台任务。
+    awaitingReply = false;
     status("Needs attention");
     document.querySelector(".pending-message")?.remove();
     // Another tab may have paused this conversation with a newly saved proposal.
     // 另一标签页可能刚保存了方案，并因此暂停了当前会话。
     if (error.status === 409 && conversation) await renderMessages().catch(() => {});
-    notice(error.message);
+    if (generation === currentGeneration) notice(error.message);
   } finally {
-    setBusy(false);
-    $("message").focus();
+    if (generation === currentGeneration) {
+      setBusy(false);
+      $("message").focus();
+    }
   }
 });
 
