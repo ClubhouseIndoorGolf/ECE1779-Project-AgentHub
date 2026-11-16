@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### 2026-11-16
+
+- **Durable conversation events and v2 replay.** Migration `0007_conversation_events` adds a per-conversation event log. The API and worker commit message, proposal, decision, job and resolution events with the corresponding business changes. The first history page supplies `X-Conversation-Event-Cursor` so clients can resume `/events?version=2` on any replica using the same PostgreSQL database. The browser continues using the default SSE stream with numeric message cursors. [Live updates API](docs/LIVE_UPDATES.md#durable-event-replay)
+- **Final replay verification** (`2314ac6`). Passed 123 backend tests on isolated PostgreSQL, 20 offline client tests, and Ruff lint and format checks. A fresh fixed-mode Compose run with two API replicas replayed six consecutive events from `v2:6` to `v2:11` using the original `v2:5` cursor. Duplicate approval returned the same receipt. PostgreSQL recorded one CAD 129.99 simulated refund, one continuation and one resolution completion event. [Manual reproduction](docs/MANUAL_TESTING.md#mt20-resume-durable-sse-on-another-api-replica)
+
 ### 2026-11-15
 
 - **Durable SSE replay verified across API replicas** (`756382d`). In an isolated fixed-mode Compose stack, API A returned the pending proposal and cursor `v2:5`. After disconnection, approval and execution finished. API B replayed six events in order, from `v2:6` to `v2:11`. Repeating approval returned the same receipt. PostgreSQL contained one CAD 129.99 simulated refund, one continuation job, and one resolution completion event. [Manual reproduction](docs/MANUAL_TESTING.md#mt20-resume-durable-sse-on-another-api-replica)

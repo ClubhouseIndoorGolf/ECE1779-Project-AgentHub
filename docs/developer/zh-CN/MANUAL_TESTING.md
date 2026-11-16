@@ -203,6 +203,8 @@ docker compose up -d --wait
 
 按[英文指南的 Compose 配置](../../MANUAL_TESTING.md#mt20-resume-durable-sse-on-another-api-replica)启动独立的固定模式环境，将两个 API 副本分别绑定到不同回环端口，并初始化 `alice`、`bob` 和演示工单。用 Alice 的身份访问两个端口。
 
+仅用浏览器检查时，在两个端口分别以 Alice 登录，并从侧栏打开同一会话。在 A 批准后关闭标签页，在 B 等候同一方案显示为已完成，或从侧栏重新打开会话读取保存的结果。浏览器使用默认 SSE 流。如需继续验证 v2 游标和事件顺序，请在另一个全新的 Compose 项目执行下列步骤，让工单 391 保持可退款状态。
+
 1. 在 API A 的新会话发送 `处理工单 391`，等待 `WAITING_FOR_APPROVAL`。读取历史首屏，保存 `proposal.id` 和 `X-Conversation-Event-Cursor`。用该游标作为 `Last-Event-ID` 打开 A 的 `/conversations/{id}/events?version=2`，收到 `ready` 后断开。
 2. 通过 API B 的 `POST /proposals/{proposal_id}/decision` 提交 `{"version":1,"decision":"APPROVE"}`。用 `resume_job_id` 查询 `GET /jobs/{id}`，等到 `SUCCEEDED`。重复批准应返回相同回执。
 3. 用原游标连接 B 的新版事件流。应依次补回审批、入队、运行、处置完成、助手回复和待办成功共六条事件，游标连续。B 的历史应显示同一方案为 `COMPLETED`。在隔离数据库执行 `SELECT count(*) FROM applied_resolutions WHERE order_id = 1001;`，确认只有一笔模拟退款。

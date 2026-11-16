@@ -56,10 +56,13 @@ All paths below are under `backend/app/`.
 | `__init__.py` | Marks the directory as the `app` Python package |
 | `config.py` | Reads environment variables, builds the database URL and validates worker timing values |
 | `db.py` | Creates each process's database connection pool and session factory; releases request sessions |
-| `models.py` | Maps `users`, `conversations`, `messages` and `jobs` to Python classes, including database constraints |
+| `models.py` | Maps chat, workflow and conversation event tables to Python classes, including database constraints |
 | `schemas.py` | Defines accepted request fields and returned response fields; validates input with Pydantic |
 | `security.py` | Verifies HTTP Basic credentials, salted scrypt hashes and account activation |
 | `main.py` | Defines HTTP endpoints, checks ownership and coordinates database operations |
+| `history.py` | Reads paginated messages, attached refund proposals and the first-page snapshot cursor |
+| `event_store.py` | Appends ordered conversation events within API and worker transactions and reads them for replay |
+| `events.py` | Streams default SSE updates and replays stored events for v2 clients |
 | `worker.py` | Claims ordered jobs, loads context, renews leases, saves replies, retries transient errors and handles expired ownership |
 | `replies.py` | Provides fixed responses or bounded OpenAI Responses API text chat |
 | `static/` | Serves the lightweight browser development client through the API |
@@ -68,7 +71,7 @@ All paths below are under `backend/app/`.
 
 Three files describe different boundaries: **`schemas.py` defines API data; `models.py` describes stored data; migrations change the actual database.** Changing a model alone does not upgrade an existing database.
 
-`main.py` provides health and account information, conversation creation/listing, message submission/history, and job status. Ownership comes from authentication, not a user ID supplied in a request body.
+`main.py` provides health and account information, conversation creation and listing, message submission and history, job status, proposal decisions and SSE. Ownership comes from the authenticated account.
 
 ## One message through the system
 
@@ -81,10 +84,10 @@ flowchart LR
 
 1. `security.py` authenticates the account and `schemas.py` validates its submitted text and UUID key.
 2. `main.py` checks conversation ownership, locks the conversation and allocates a message sequence number.
-3. One transaction saves the user message, advances the sequence counter and creates a queued job. The API returns the message and job IDs.
+3. One transaction saves the user message, advances the sequence counter, creates a queued job and appends both events. The API returns the message and job IDs.
 4. `worker.py` claims a job using a row lock that skips work held by other workers. It assigns a fresh ownership token and an expiry time.
-5. The worker loads bounded conversation context and generates a fixed or model reply. One transaction saves it, advances the sequence and marks the job successful, conditional on the claim still being valid.
-6. The client queries message history or job status through the API.
+5. The worker generates a reply or processes a supported fixed-mode refund request. The worker commits the result, job state and corresponding events under the same lease check.
+6. The browser reads current state through the API and follows the default SSE stream. API clients may opt into v2 to resume stored events from their last cursor.
 
 `messages` stores what was said; `jobs` stores processing state. Reusing a submission key with identical text returns the original IDs; changing the text returns `409`. Expired claims can be recovered, and an old token cannot complete a job after ownership changes. A background heartbeat renews the lease during model calls; database sessions are closed between checkpoints and renewals.
 
@@ -97,6 +100,7 @@ flowchart LR
 | `backend/migrations/script.py.mako` | Template for creating new revision files |
 | `backend/migrations/versions/0001_initial.py` | Creates the four initial tables, constraints and indexes using frozen SQL |
 | `backend/migrations/versions/0002_english_defaults.py` | Sets the English default for future conversation titles, without rewriting existing records |
+| `backend/migrations/versions/0007_conversation_events.py` | Adds per-conversation event heads and the durable log, and initializes heads for existing conversations |
 
 Alembic records the applied revision in `alembic_version` and executes pending revisions. Add a new migration for a schema change rather than editing one already used by the team. Field definitions are explained in the [database reference](BACKEND_DATABASE.md).
 
@@ -111,6 +115,7 @@ Alembic records the applied revision in `alembic_version` and executes pending r
 | `backend/pyproject.toml` | pytest paths and Ruff checking/formatting rules |
 | `backend/tests/conftest.py` | Migrates and resets only the isolated test database; prepares accounts and an HTTP client |
 | `backend/tests/test_backend.py` | Checks authentication, message flow, duplicate requests, transactions, worker ownership and migrations |
+| `backend/tests/test_event_store.py` and `backend/tests/test_events.py` | Cover event ordering and rollback, plus snapshot and SSE cursor behavior |
 | `.github/workflows/ci.yml` | Builds images, runs checks and database tests, then starts services and runs the smoke check |
 
 Integration tests exercise controlled success and failure conditions. `smoke.py` instead checks actual HTTP communication between running services. CI currently verifies changes; it does not publish images or deploy the application.
@@ -141,6 +146,6 @@ Integration tests exercise controlled success and failure conditions. `smoke.py`
 | Change startup, ports or service configuration | `compose.yaml` and `.env.example` |
 | Change credentials or account management | `security.py` or `manage.py` |
 
-Keep runtime messages English and source comments bilingual. A browser development client and optional model calls are available. The team's main frontend, approval workflow, SSE and simulated business service remain planned work.
+Keep runtime messages English and source comments bilingual. The browser workspace supports the fixed-mode simulated refund approval workflow and SSE live updates. [Live updates and cross-replica replay](LIVE_UPDATES.md)
 
 A useful reading order is `compose.yaml` → `schemas.py` → `models.py` → `main.py` → `worker.py` → migrations → tests.

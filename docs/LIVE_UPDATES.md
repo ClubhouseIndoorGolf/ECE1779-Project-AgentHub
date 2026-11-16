@@ -25,9 +25,9 @@ Each connection tracks the state it has already sent, so it sends a job or propo
 
 ## Durable event replay
 
-1. Read the first page of `GET /conversations/{id}/messages` with `after_seq=0` or without a cursor. The body remains a message list. The `X-Conversation-Event-Cursor` response header comes from the same database snapshot as the page. Use `after_seq` from the message sequence to load subsequent pages.
+1. Read the first page of `GET /conversations/{id}/messages` with `after_seq=0` or omit that parameter. The body remains a message list. The `X-Conversation-Event-Cursor` response header captures the conversation's event head from the same database snapshot as that page. Use the last message's `seq` as `after_seq` to load subsequent pages. Each page is a separate read, and the v2 cursor is returned only with the first page.
 2. Open `GET /conversations/{id}/events?version=2` with that header value as `Last-Event-ID`. On reconnect, send the ID of the last complete event frame. The server replays later events from PostgreSQL in sequence order. An explicit `v2:0` starts at the first recorded event.
-3. Retain the cursor per conversation. Deduplicate replayed frames by conversation ID and event sequence, and use the message and job endpoints to refresh current state.
+3. Retain the cursor per conversation. Deduplicate replayed frames by conversation ID and event sequence. Each event describes a committed transition and carries references to the affected records. Read history or job status to retrieve the current state and full message or proposal details.
 
 The version 2 endpoint returns `422` before streaming if the cursor is missing, malformed, a legacy numeric cursor, or ahead of the conversation's committed event head. Reload the history snapshot to obtain a valid cursor. Both versions check the same account ownership and use short database sessions.
 
@@ -35,7 +35,7 @@ Each stored frame uses an event name such as `proposal.decided` and an ID such a
 
 ## Browser client
 
-[chat.js](../backend/app/static/chat.js) currently reads the default stream with authenticated `fetch` and a body reader.
+The browser reads the default stream with authenticated `fetch` and a body reader. With the same account and conversation open in two browsers, a refund approved in one browser can finish after that browser closes. The other browser can see the saved result through its live updates or after reopening the conversation. A streaming HTTP client can verify the individual v2 events. [Browser implementation](../backend/app/static/chat.js) · [Cross-replica replay test](MANUAL_TESTING.md#mt20-resume-durable-sse-on-another-api-replica)
 
 - **Starting and stopping.** Opening or creating a conversation starts its stream. Starting a new chat or signing out closes it.
 - **Reconnection.** After a normal close, the client reconnects within 250 ms. After a failure, it backs off from 1 s to at most 15 s with jitter. A stream with no data for 45 seconds is treated as dropped. A `401` or `404` stops the stream without retrying.
@@ -48,7 +48,9 @@ Each stored frame uses an event name such as `proposal.decided` and an ID such a
 
 Automated coverage:
 
+- [test_event_store.py](../backend/tests/test_event_store.py) covers migration from `0006`, concurrent writes, ordered reads and rollback of business changes with the event batch.
 - [test_events.py](../backend/tests/test_events.py) covers ownership and legacy replay, plus the durable snapshot cursor, cursor validation, ordered page replay, and approval committed between the snapshot reads.
+- [test_resolution_workflow.py](../backend/tests/test_resolution_workflow.py) covers duplicate approval, worker takeover, lease expiration while waiting for the event head and atomic rollback.
 - [test_chat_client.cjs](../backend/tests/test_chat_client.cjs) covers completing a send from a pushed job event without polling, parsing a frame split across chunks, reconnecting with `Last-Event-ID`, and the polling fallback after `404`. It also verifies draft retention after signing back in to the same account and workspace isolation when a different account signs in during an in-flight send.
 
 Manual check against the running stack, with credentials from your private `.env`:
