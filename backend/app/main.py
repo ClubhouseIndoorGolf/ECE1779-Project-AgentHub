@@ -15,6 +15,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal, engine, get_session
+from app.event_store import EventToAppend, append_events, job_status_event, message_created_event
 from app.events import ConversationStream, conversation_events, parse_last_event_id
 from app.history import read_history
 from app.models import (
@@ -32,6 +33,7 @@ from app.resolution_workflow import (
     PROPOSAL_VERSION,
     active_resolution_exists,
     close_proposal,
+    invalidate_proposal,
     unfinished_turn_before,
 )
 from app.schemas import (
@@ -157,8 +159,8 @@ def submit_message(
     user: User = Depends(current_user),
     session: Session = Depends(get_session),
 ):
-    """Atomically save one logical message and job, returning stable IDs for identical retries.
-    原子保存一条逻辑消息及其任务；相同内容和去重标识的重试始终返回原有编号。
+    """Atomically save the message, job and their events, with stable IDs for retries.
+    原子保存消息、待办及其事件，重复提交返回原有编号。
     """
     with session.begin():
         # Ownership and sequence allocation share a row lock with worker completion.
@@ -204,6 +206,9 @@ def submit_message(
         job = Job(source_message_id=message.id)
         session.add(job)
         session.flush()
+        # Only a new submission reaches this point. Record the message before its queued job.
+        # 只有新提交会到达这里。先记录消息，再记录对应待办入队。
+        append_events(session, conversation.id, [message_created_event(message), job_status_event(job)])
         result = SubmissionOut(message_id=message.id, job_id=job.id)
     return result
 
@@ -287,8 +292,8 @@ def decide_proposal(
     user: User = Depends(current_user),
     session: Session = Depends(get_session),
 ):
-    """Record one human decision and enqueue an approved continuation atomically.
-    原子保存一份人工决定，并在批准时加入恢复待办。
+    """Persist a human decision, its events and any approved continuation atomically.
+    原子保存人工决定、对应事件和获批的恢复待办。
     """
     with session.begin():
         # Serialize decisions with message submissions and final replies in the same conversation.
@@ -325,7 +330,10 @@ def decide_proposal(
             )
         now = session.scalar(select(func.clock_timestamp()))
         if now >= proposal.expires_at:
-            close_proposal(session, conversation, execution, "INVALIDATED", EXPIRED_REPLY)
+            events = invalidate_proposal(
+                session, conversation, execution, proposal.id, "EXPIRED", EXPIRED_REPLY
+            )
+            append_events(session, conversation.id, events)
         else:
             # Only approval queues work. Rejection records a final reply without business writes.
             # 只有批准才入队。拒绝仅保存最终回复，不写入业务数据。
@@ -336,10 +344,12 @@ def decide_proposal(
                 session.flush([job])
                 execution.status = "APPROVED"
                 conversation.updated_at = now
+                followup = job_status_event(job)
             else:
-                close_proposal(
+                message = close_proposal(
                     session, conversation, execution, "REJECTED", "The refund proposal was rejected."
                 )
+                followup = message_created_event(message)
             decision = ProposalDecision(
                 proposal_id=proposal.id,
                 user_id=user.id,
@@ -348,6 +358,20 @@ def decide_proposal(
                 resume_job_id=job.id if job else None,
             )
             session.add(decision)
+            # The decision precedes the continuation or final reply in the event log.
+            # 在事件日志中，先记录决定，再记录恢复待办或最终回复。
+            decision_event = EventToAppend(
+                "proposal.decided",
+                {
+                    "proposal_id": str(proposal.id),
+                    "execution_id": str(execution.id),
+                    "source_message_id": str(execution.source_message_id),
+                    "decision": decision.decision,
+                    "status": "QUEUED" if job else "REJECTED",
+                    "resume_job_id": str(job.id) if job else None,
+                },
+            )
+            append_events(session, conversation.id, [decision_event, followup])
             return ProposalDecisionOut.model_validate(decision)
 
     # Commit the expiration and its reply before returning the conflict to the client.

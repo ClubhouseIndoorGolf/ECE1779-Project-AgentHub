@@ -5,7 +5,7 @@
 import time
 from datetime import timedelta
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -13,6 +13,7 @@ from openai import OpenAI
 from sqlalchemy import func, select
 
 from app.db import SessionLocal, engine
+from app.event_store import read_events
 from app.models import Job
 from app.replies import OpenAIReply, ReplySettings, RetryableReplyError, build_reply_provider
 from app.worker import LostLease, claim_job, complete_job, load_context, renew_lease, run_once
@@ -174,7 +175,7 @@ def test_stale_worker_cannot_renew_lease(client):
     """Reject an old claim token after an expired task is reclaimed.
     验证过期任务被重新领取后，旧令牌不能继续续租。
     """
-    submit(client)
+    conversation, _ = submit(client)
     old = claim_job("old")
     with SessionLocal.begin() as session:
         session.get(Job, old.job_id).lease_expires_at = func.clock_timestamp() - timedelta(seconds=1)
@@ -182,6 +183,14 @@ def test_stale_worker_cannot_renew_lease(client):
     with pytest.raises(LostLease):
         renew_lease(old)
     renew_lease(new)
+    # Renewal changes private lease data only. The two claims are the only new events.
+    # 续租只改变内部租约数据，两次领取是唯一的新事件。
+    with SessionLocal() as session:
+        assert [row.payload["attempts"] for row in read_events(session, UUID(conversation), after_seq=1)] == [
+            0,
+            1,
+            2,
+        ]
 
 
 def test_transient_failure_uses_persisted_bounded_retries(client):
@@ -208,13 +217,22 @@ def test_transient_failure_uses_persisted_bounded_retries(client):
     run_once(provider=provider, max_attempts=2)
     assert client.get(f"/jobs/{receipt['job_id']}").json()["status"] == "FAILED"
     assert len(client.get(f"/conversations/{conversation}/messages").json()) == 1
+    with SessionLocal() as session:
+        rows = read_events(session, UUID(conversation), after_seq=1)
+        assert [(row.payload["status"], row.payload["attempts"]) for row in rows] == [
+            ("QUEUED", 0),
+            ("RUNNING", 1),
+            ("QUEUED", 1),
+            ("RUNNING", 2),
+            ("FAILED", 2),
+        ]
 
 
 def test_provider_error_does_not_expose_secret(client, caplog):
     """Keep provider exception text out of both public job errors and logs.
     验证提供商异常正文不会泄漏到公开任务错误或日志中。
     """
-    _, receipt = submit(client)
+    conversation, receipt = submit(client)
 
     def generate(_messages):
         """Inject a recognizable private value to detect accidental disclosure.
@@ -226,6 +244,15 @@ def test_provider_error_does_not_expose_secret(client, caplog):
     job = client.get(f"/jobs/{receipt['job_id']}").json()
     assert job["status"] == "FAILED"
     assert "sensitive-provider-value" not in job["last_error"] + caplog.text
+    with SessionLocal() as session:
+        failure = read_events(session, UUID(conversation), after_seq=3)[0]
+        assert failure.payload == {
+            "job_id": receipt["job_id"],
+            "source_message_id": receipt["message_id"],
+            "kind": "PROCESS_MESSAGE",
+            "status": "FAILED",
+            "attempts": 1,
+        }
 
 
 def model_client(handler):

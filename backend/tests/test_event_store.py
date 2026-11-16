@@ -147,44 +147,42 @@ def test_append_rolls_back_with_caller_business_write(client):
         assert append_events(session, conversation, [EventToAppend("proposal.decided", {})]) == [2]
 
 
-def test_upgrade_from_0006_preserves_refund_and_proposal_history(client, accounts):
+def test_upgrade_from_0006_preserves_refund_and_proposal_history(client):
     """Migrate actual workflow data and start each existing chat at an empty cursor.
     迁移实际业务流程数据，并为每个已有会话初始化空游标。
     """
+    seed_demo_orders("alice", "bob", with_tickets=True)
+    bob_auth = ("bob", "bob-test-password")
+    completed_id = create_chat(client)
+    pending_response = client.post("/conversations", json={}, auth=bob_auth)
+    assert pending_response.status_code == 201
+    pending_id = UUID(pending_response.json()["id"])
+    completed_path = f"/conversations/{completed_id}/messages"
+    pending_path = f"/conversations/{pending_id}/messages"
+    for path, ticket, options in [(completed_path, 391, {}), (pending_path, 395, {"auth": bob_auth})]:
+        payload = {"content": f"Prepare a refund for ticket {ticket}", "submission_key": str(uuid4())}
+        assert client.post(path, json=payload, **options).status_code == 202
+        assert run_once("migration-fixture-worker")
+
+    proposal_id = client.get(completed_path).json()[0]["proposal"]["id"]
+    decision_path = f"/proposals/{proposal_id}/decision"
+    approval = {"version": 1, "decision": "APPROVE"}
+    response = client.post(decision_path, json=approval)
+    assert response.status_code == 200
+    receipt = response.json()
+    assert run_once("migration-fixture-worker")
+    completed_history = client.get(completed_path).json()
+    pending_history = client.get(pending_path, auth=bob_auth).json()
+    assert completed_history[0]["proposal"]["status"] == "COMPLETED"
+    assert pending_history[0]["proposal"]["status"] == "WAITING_FOR_APPROVAL"
+    with SessionLocal() as session:
+        refund_before = session.execute(select(AppliedResolution.__table__)).one()
+
+    # Downgrading the additive event migration leaves a populated 0006 business schema.
+    # 回退只新增事件表的迁移，得到带有业务数据的 0006 数据库。
     cfg = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
     command.downgrade(cfg, "0006_approved_resolutions")
-    try:
-        seed_demo_orders("alice", "bob", with_tickets=True)
-        # Create conversations with the pre-0007 schema, then populate them through the real workflow.
-        # 使用 0007 之前的表结构创建会话，再通过真实流程写入业务数据。
-        with SessionLocal.begin() as session:
-            completed = Conversation(user_id=accounts[0])
-            pending = Conversation(user_id=accounts[1])
-            session.add_all([completed, pending])
-            session.flush()
-        bob_auth = ("bob", "bob-test-password")
-        completed_path = f"/conversations/{completed.id}/messages"
-        pending_path = f"/conversations/{pending.id}/messages"
-        for path, ticket, options in [(completed_path, 391, {}), (pending_path, 395, {"auth": bob_auth})]:
-            payload = {"content": f"Prepare a refund for ticket {ticket}", "submission_key": str(uuid4())}
-            assert client.post(path, json=payload, **options).status_code == 202
-            assert run_once("pre-migration-worker")
-
-        proposal_id = client.get(completed_path).json()[0]["proposal"]["id"]
-        decision_path = f"/proposals/{proposal_id}/decision"
-        approval = {"version": 1, "decision": "APPROVE"}
-        response = client.post(decision_path, json=approval)
-        assert response.status_code == 200
-        receipt = response.json()
-        assert run_once("pre-migration-worker")
-        completed_history = client.get(completed_path).json()
-        pending_history = client.get(pending_path, auth=bob_auth).json()
-        assert completed_history[0]["proposal"]["status"] == "COMPLETED"
-        assert pending_history[0]["proposal"]["status"] == "WAITING_FOR_APPROVAL"
-        with SessionLocal() as session:
-            refund_before = session.execute(select(AppliedResolution.__table__)).one()
-    finally:
-        command.upgrade(cfg, "head")
+    command.upgrade(cfg, "head")
 
     # Compare public data and the full business result, then check the first allocated sequence.
     # 核对公开数据和完整业务结果，再检查迁移后分配的首个序号。
@@ -193,9 +191,9 @@ def test_upgrade_from_0006_preserves_refund_and_proposal_history(client, account
     assert client.post(decision_path, json=approval).json() == receipt
     with SessionLocal.begin() as session:
         assert session.execute(select(AppliedResolution.__table__)).one() == refund_before
-        for conversation_id in (completed.id, pending.id):
+        for conversation_id in (completed_id, pending_id):
             assert read_event_head(session, conversation_id) == 0
             assert read_events(session, conversation_id) == []
         assert append_events(
-            session, pending.id, [EventToAppend("job.status_changed", {"status": "QUEUED"})]
+            session, pending_id, [EventToAppend("job.status_changed", {"status": "QUEUED"})]
         ) == [1]

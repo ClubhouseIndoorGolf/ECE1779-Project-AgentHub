@@ -16,6 +16,7 @@ from sqlalchemy import event, func, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.db import SessionLocal, engine
+from app.event_store import read_event_head, read_events
 from app.manage import save_user, seed_demo_orders
 from app.models import Base, Conversation, Execution, Job, Message, Order, ResolutionProposal, Ticket, User
 from app.refund_eligibility import evaluate_refund_eligibility, parse_refund_order_id
@@ -359,7 +360,8 @@ def test_structured_refund_action_preserves_agent_draft_and_uses_order_amount(cl
     with pytest.raises(ValidationError):
         PrepareRefund.model_validate({"ticket_id": 391, "refund_amount_minor": 1})
     with SessionLocal.begin() as session:
-        assert prepare_refund(session, UUID(receipt["message_id"]), accounts[0], action) is None
+        proposal = prepare_refund(session, UUID(receipt["message_id"]), accounts[0], action)
+        assert isinstance(proposal, ResolutionProposal)
     with SessionLocal() as session:
         assert session.scalars(select(ResolutionProposal)).one().customer_reply == draft
         assert session.scalars(select(Execution)).one().refund_amount_minor == 12999
@@ -404,6 +406,16 @@ def test_refund_completion_rejects_stale_claim_and_rolls_back(client, content, h
         assert session.scalar(select(func.count()).select_from(Execution)) == 0
         assert session.scalar(select(func.count()).select_from(ResolutionProposal)) == 0
         assert session.get(Conversation, conversation).next_message_seq == 2
+        # The failed terminal write rolls back proposal or reply events and the reserved cursor.
+        # 终态写入失败时，方案或回复事件与预留游标一起回滚。
+        conversation_id = UUID(conversation)
+        assert read_event_head(session, conversation_id) == 4
+        assert [row.event_type for row in read_events(session, conversation_id)] == [
+            "message.created",
+            "job.status_changed",
+            "job.status_changed",
+            "job.status_changed",
+        ]
     assert len(client.get(f"/conversations/{conversation}/messages").json()) == 1
     assert client.get(f"/jobs/{receipt['job_id']}").json()["status"] == "RUNNING"
 
@@ -411,6 +423,10 @@ def test_refund_completion_rejects_stale_claim_and_rolls_back(client, content, h
     with SessionLocal() as session:
         assert session.scalar(select(func.count()).select_from(Execution)) == 1
         assert session.scalar(select(func.count()).select_from(ResolutionProposal)) == int(has_proposal)
+        outcome, job_event = read_events(session, UUID(conversation), after_seq=4)
+        assert outcome.seq == 5
+        assert outcome.event_type == ("proposal.created" if has_proposal else "message.created")
+        assert job_event.payload["status"] == "SUCCEEDED"
     messages = client.get(f"/conversations/{conversation}/messages").json()
     assert len(messages) == (1 if has_proposal else 2)
     assert ("proposal" in messages[0]) == has_proposal

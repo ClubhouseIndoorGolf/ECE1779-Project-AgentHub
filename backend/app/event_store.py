@@ -9,7 +9,7 @@ from uuid import UUID
 from sqlalchemy import insert, select, update
 from sqlalchemy.orm import Session
 
-from app.models import ConversationEvent, ConversationEventHead
+from app.models import ConversationEvent, ConversationEventHead, Job, Message
 
 MAX_EVENT_PAGE_SIZE = 500
 MAX_EVENT_SEQ = 2**63 - 1
@@ -23,6 +23,32 @@ class EventToAppend:
 
     event_type: str
     payload: dict
+
+
+def message_created_event(message: Message) -> EventToAppend:
+    """Capture a message reference after assigning its ID and history sequence.
+    分配消息编号和历史序号后，保存消息引用。
+    """
+    return EventToAppend(
+        "message.created",
+        {"message_id": str(message.id), "message_seq": message.seq, "role": message.role},
+    )
+
+
+def job_status_event(job: Job, *, status: str | None = None, attempts: int | None = None) -> EventToAppend:
+    """Capture public job progress, optionally describing a transition about to commit.
+    记录公开的待办进度，也可描述即将提交的状态和尝试次数。
+    """
+    return EventToAppend(
+        "job.status_changed",
+        {
+            "job_id": str(job.id),
+            "source_message_id": str(job.source_message_id),
+            "kind": job.kind,
+            "status": job.status if status is None else status,
+            "attempts": job.attempts if attempts is None else attempts,
+        },
+    )
 
 
 def append_events(session: Session, conversation_id: UUID, events: Sequence[EventToAppend]) -> list[int]:
