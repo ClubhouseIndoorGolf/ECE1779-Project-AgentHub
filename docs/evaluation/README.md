@@ -51,3 +51,32 @@ for arbitrary prompts. The application authorization boundary is tested separate
 
 `deterministic.json` is generated evidence for this implementation. No live model
 report is included until a real provider run has been performed.
+
+## Recorded local verification
+
+Implementation revision: `e081fba67bd86b6626e37fd916e16c89bdc93674`.
+
+| Check | Observed result |
+| --- | --- |
+| Backend integration suite, isolated PostgreSQL | 138 passed; includes four real process-kill cases |
+| Browser state suite | 12 passed |
+| Offline deployment regressions in Linux | 48 passed |
+| Ruff lint and format | Passed, 35 Python files |
+| Compose configuration and runtime/test image builds | Passed |
+| Running fixed-mode API/database/worker smoke | Passed, including duplicate-submission check |
+| Scripted evaluation | 7/7 passed, no unapproved effects; approved eligible case completed |
+| Synthetic worker benchmark | Median 7.46 jobs/s with one worker and 12.14 with two; three trials each, zero extra attempts |
+| Live model / cloud deployment | Not run; no local API key configured |
+
+The machine's PostgreSQL container clock was observed moving backward three times
+over 55 seconds (about 0.8–1.6 seconds each). Earlier test runs consequently hit
+intermittent immediate-claim timing failures, including an existing baseline test.
+The process harness now polls like the real worker, and the natural-expiry test
+waits for database time. Production scheduling and lease fencing were not relaxed.
+The final full suite passed. Database-timestamp latency measurements should be
+repeated on a stable-clock host before making course-report reliability/scaling
+claims; the saved benchmark is local synthetic evidence, not a production result.
+
+The suite also reports an upstream FastAPI/Starlette `TestClient` deprecation
+warning about HTTPX; it does not fail these tests. No dependency upgrade was made
+as part of the execution work.
