@@ -4,6 +4,7 @@
 
 ### 2026-11-15
 
+- **Durable SSE replay verified across API replicas** (`756382d`). In an isolated fixed-mode Compose stack, API A returned the pending proposal and cursor `v2:5`. After disconnection, approval and execution finished. API B replayed six events in order, from `v2:6` to `v2:11`. Repeating approval returned the same receipt. PostgreSQL contained one CAD 129.99 simulated refund, one continuation job, and one resolution completion event. [Manual reproduction](docs/MANUAL_TESTING.md#mt20-resume-durable-sse-on-another-api-replica)
 - **Account isolation after reauthentication.** Reauthenticating with the same account after an SSE-related `401` preserves the open conversation and its draft and restarts live updates. Signing in with another account clears the previous account's conversation, drafts, and pending submission state before loading the new account's workspace. Responses to earlier requests cannot update the new workspace. [Live updates guide](docs/LIVE_UPDATES.md#browser-client)
 
 ### 2026-11-14

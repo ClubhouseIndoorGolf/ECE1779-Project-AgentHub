@@ -1,6 +1,6 @@
 # Backend Manual Testing Guide
 
-Use Swagger UI or Postman for the authenticated chat and worker checks (MT01–MT15). Use the browser workspace for the fixed-mode refund workflow (MT16–MT19).
+Use Swagger UI or Postman for the authenticated chat and worker checks (MT01–MT15). Use the browser workspace for the fixed-mode refund workflow (MT16–MT19) and an SSE client for cross-replica replay (MT20).
 
 For setup details, see the [team guide](../README.md). The [Chinese companion](developer/zh-CN/MANUAL_TESTING.md) uses the same case IDs and result fields.
 
@@ -199,6 +199,37 @@ Use a fresh local demo database with `REPLY_MODE=fixed`. After starting Compose,
 
 To check decision retries in Swagger, obtain the completed card's `proposal.id` from the conversation history response. Post `{"version":1,"decision":"APPROVE"}` to `/proposals/{proposal_id}/decision` twice. Both requests return the same receipt. Posting `REJECT` for the same proposal returns HTTP `409`.
 
+### MT20 Resume durable SSE on another API replica
+
+Use a fresh isolated Compose project. Set `COMPOSE_PROJECT_NAME=agenthub-sse-manual` and `REPLY_MODE=fixed` in your shell, and use the private local settings from the preparation steps. Save this temporary override as `compose.sse-check.yaml` to give each API replica its own loopback port.
+
+```yaml
+services:
+  api:
+    ports: !override
+      - target: 8000
+        host_ip: 127.0.0.1
+        protocol: tcp
+```
+
+```bash
+docker compose -p agenthub-sse-manual -f compose.yaml -f compose.sse-check.yaml up -d --build --wait --scale api=2
+docker compose -p agenthub-sse-manual -f compose.yaml -f compose.sse-check.yaml port --index 1 api 8000
+docker compose -p agenthub-sse-manual -f compose.yaml -f compose.sse-check.yaml port --index 2 api 8000
+```
+
+Use the same Compose options with `run --rm admin create-user alice`, `run --rm admin create-user bob`, and `run --rm admin seed-demo-tickets alice bob`. Skip account creation for accounts that already exist in this project. Use Alice's Basic Auth credentials when calling either API. Treat the first port as API A and the second as API B.
+
+1. In a new conversation on A, submit `Prepare a refund for ticket 391` and wait for `WAITING_FOR_APPROVAL`. Read the first page of `GET /conversations/{id}/messages`, then save `proposal.id` and the `X-Conversation-Event-Cursor` header.
+2. Open `GET /conversations/{id}/events?version=2` on A with `Last-Event-ID` set to the saved cursor. In a streaming terminal client, use `curl -N --user alice -H "Last-Event-ID: v2:5" "http://127.0.0.1:PORT/conversations/ID/events?version=2"`, replacing the port, ID and cursor with your values. Use `curl.exe` in Windows PowerShell. Curl prompts for the password. Close the stream after `ready`.
+3. On B, post `{"version":1,"decision":"APPROVE"}` to `/proposals/{proposal_id}/decision`. Check that the `resume_job_id` returned by the response reaches `SUCCEEDED` through `GET /jobs/{id}`. Repeating the decision should return the same receipt.
+4. Open the stream on B with the original cursor. After `ready`, the six consecutive events should show `proposal.decided`, job `QUEUED`, job `RUNNING`, `resolution.completed`, `message.created`, and job `SUCCEEDED`, in that order. History on B should show the original proposal as `COMPLETED`.
+5. Open `psql` in the isolated database container and confirm `SELECT count(*) FROM applied_resolutions WHERE order_id = 1001;` returns `1`.
+
+```bash
+docker compose -p agenthub-sse-manual -f compose.yaml -f compose.sse-check.yaml exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+```
+
 ## Investigate a failure
 
 Record the case ID, HTTP status, sanitized response, relevant resource IDs and time. Inspect a failed job's `last_error` and the relevant logs:
@@ -246,10 +277,11 @@ Copy this section for each manual test run. Result values are `NOT_RUN`, `PASS`,
 | MT17 | Pending proposal after refresh | One card with the same amount and draft | To fill | NOT_RUN |
 | MT18 | Reject proposal | Rejected; ticket remains open | To fill | NOT_RUN |
 | MT19 | Approve and reopen history | Completed; one simulated refund and resolved ticket | To fill | NOT_RUN |
+| MT20 | Resume v2 SSE on another API replica | Six ordered events and one simulated refund | To fill | NOT_RUN |
 
 | Follow-up detail | Value |
 | --- | --- |
-| Totals | PASS: __ / FAIL: __ / BLOCKED: __ / NOT_RUN: __; total 19 |
+| Totals | PASS: __ / FAIL: __ / BLOCKED: __ / NOT_RUN: __; total 20 |
 | Issue links and reproduction steps | To fill |
 | Retest date and result | To fill |
 | Environment restored | To fill: confirm the worker is running and check pending work and service health |
