@@ -17,7 +17,16 @@ from sqlalchemy.orm import Session
 from app.db import SessionLocal, engine, get_session
 from app.events import ConversationStream, conversation_events, parse_last_event_id
 from app.history import read_history
-from app.models import Conversation, Execution, Job, Message, ProposalDecision, ResolutionProposal, User
+from app.models import (
+    Conversation,
+    ConversationEventHead,
+    Execution,
+    Job,
+    Message,
+    ProposalDecision,
+    ResolutionProposal,
+    User,
+)
 from app.resolution_workflow import (
     EXPIRED_REPLY,
     PROPOSAL_VERSION,
@@ -98,13 +107,16 @@ def me(user: User = Depends(current_user)):
 def create_conversation(
     payload: ConversationCreate, user: User = Depends(current_user), session: Session = Depends(get_session)
 ):
-    """Create a conversation owned by the authenticated user in one short transaction.
-    在短事务中创建属于已验证用户的会话，所有权由认证结果确定。
+    """Create an owned conversation and its zero event cursor in one transaction.
+    在同一事务中为已验证用户创建会话及初始值为零的事件游标。
     """
     with session.begin():
         conversation = Conversation(user_id=user.id, title=payload.title)
         session.add(conversation)
         session.flush()
+        # The generated conversation ID must exist before its event counter can reference it.
+        # 必须先写入会话编号，事件计数器才能引用它。
+        session.add(ConversationEventHead(conversation_id=conversation.id))
     return conversation
 
 
