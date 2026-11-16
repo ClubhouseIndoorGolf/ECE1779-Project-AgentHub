@@ -61,22 +61,28 @@ selected=''; completed=false
 # Track one new task and use its terminal state and exit code to decide whether to proceed.
 # 跟踪本次新增的唯一任务，根据终态和退出码决定是否继续。
 while (( SECONDS < deadline )); do
-  tasks=$(docker service ps --no-trunc -q "${STACK}_setup")
+  tasks=$(probe_before_deadline "$deadline" docker service ps --no-trunc -q "${STACK}_setup") || break
   while IFS= read -r id; do
     [[ -n $id && -z ${seen[$id]:-} ]] || continue
     [[ -z $selected || $selected == "$id" ]] || fail 'Multiple new setup tasks detected; stop for review'
     selected=$id
   done <<< "$tasks"
   if [[ -n $selected ]]; then
-    state=$(docker inspect --type task --format '{{.Status.State}}' "$selected")
+    state=$(probe_before_deadline "$deadline" docker inspect --type task --format '{{.Status.State}}' "$selected") || break
     case $state in
       complete)
-        [[ $(docker inspect --type task --format '{{.Status.ContainerStatus.ExitCode}}' "$selected") == 0 ]] || fail 'Setup returned a nonzero exit code'
+        exit_code=$(probe_before_deadline "$deadline" docker inspect --type task --format '{{.Status.ContainerStatus.ExitCode}}' "$selected") || break
+        # A completed query must still arrive within the setup wait budget.
+        # 即使查询已完成，结果仍必须在 setup 等待预算内返回。
+        (( SECONDS < deadline )) || break
+        [[ $exit_code == 0 ]] || fail 'Setup returned a nonzero exit code'
         completed=true; break ;;
       failed|rejected|orphaned|shutdown) fail "Setup ended unsuccessfully ($state); applications remain stopped" ;;
     esac
   fi
-  sleep 2
+  remaining=$((deadline - SECONDS))
+  (( remaining > 0 )) || break
+  sleep "$((remaining < 2 ? remaining : 2))"
 done
 [[ $completed == true ]] || fail 'Setup timed out; it may still be running. Do not restart it blindly.'
 note 'Alembic migration and bootstrap completed with exit code 0.'

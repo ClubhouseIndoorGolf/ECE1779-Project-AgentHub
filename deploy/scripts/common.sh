@@ -103,32 +103,38 @@ on_node() {
 # Inspect every task in the service history, including tasks that are shutting down.
 # 检查服务历史中的所有任务，包括正在停止的任务。
 task_states() {
-  local ids
-  ids=$(docker service ps --no-trunc -q "$1") || return 1
+  local ids deadline=${2:-$((SECONDS + DEPLOY_TIMEOUT))}
+  ids=$(probe_before_deadline "$deadline" docker service ps --no-trunc -q "$1") || return 1
   [[ -n $ids ]] || return 0
   local -a tasks
   mapfile -t tasks <<< "$ids"
-  docker inspect --type task --format '{{.Status.State}}' "${tasks[@]}"
+  probe_before_deadline "$deadline" docker inspect --type task --format '{{.Status.State}}' "${tasks[@]}"
 }
 
 # Accept an empty service or a service whose tasks have all reached a recognized terminal state.
 # 服务没有任务，或所有任务都进入受认可的终态时，判定该服务已停止。
 stopped() {
   local states state
-  states=$(task_states "$1") || return 1
+  states=$(task_states "$@") || return 1
   while IFS= read -r state; do
     case $state in ''|complete|shutdown|failed|rejected) ;; *) return 1 ;; esac
   done <<< "$states"
 }
 
-# Poll for task shutdown. The deadline is checked after each unsuccessful poll.
-# 轮询任务是否停止。每次轮询未确认停止后，才检查截止时间。
+# Bound shutdown queries by one deadline and reject results received after it.
+# 用同一截止时间限制停止状态查询，并拒绝截止后才收到的结果。
 wait_stopped() {
-  local service=$1 deadline=$((SECONDS + DEPLOY_TIMEOUT))
-  until stopped "$service"; do
-    (( SECONDS < deadline )) || fail "Tasks did not stop: $service. Resolve unfinished/orphaned tasks before retrying."
-    sleep 2
+  local service=$1 deadline=$((SECONDS + DEPLOY_TIMEOUT)) remaining
+  while (( SECONDS < deadline )); do
+    if stopped "$service" "$deadline"; then
+      (( SECONDS < deadline )) && return 0
+      break
+    fi
+    remaining=$((deadline - SECONDS))
+    (( remaining > 0 )) || break
+    sleep "$((remaining < 2 ? remaining : 2))"
   done
+  fail "Tasks did not stop: $service. Resolve unfinished/orphaned tasks before retrying."
 }
 
 # Apply the remaining time budget to one command, with a short grace period before forced termination.

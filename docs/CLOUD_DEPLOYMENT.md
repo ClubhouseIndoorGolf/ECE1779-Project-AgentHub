@@ -208,6 +208,11 @@ The sequence is:
    desired task is running and container-healthy on its actual node. Paused updates
    fail. Default timeout is 300 seconds per wait, adjustable for slower hosts.
 
+Shutdown, setup-completion and health waits bound each Docker/SSH query by the
+remaining `DEPLOY_TIMEOUT` budget and reject successful results received after
+the deadline. A stuck query gets at most one additional second before forced
+termination. This is a per-wait budget, not a timeout for the entire deployment.
+
 On migration failure/timeout the script stops, leaves applications at zero and
 leaves setup armed so a later invocation refuses to rerun it blindly. It neither
 deletes data nor rolls back a schema. Inspect task history/logs privately, determine
@@ -295,7 +300,8 @@ do not search for a generic `bash.exe`, which could select WSL. If Git Bash is
 not found, the tests report how to set `GIT_BASH_PATH`. Set that variable in the
 same PowerShell session for both the syntax checks and unit tests when you need
 to select a nonstandard installation. PowerShell passes paths containing spaces
-as one argument.
+as one argument. Bash discovery and validation run once in the outer test runner;
+the fake Docker subprocesses do not repeat them or depend on the rewritten `PATH`.
 
 Use the existing runbook's placeholder environment for `docker stack config`.
 Unit tests use temporary files, a fake Docker CLI and a mock API on an ephemeral

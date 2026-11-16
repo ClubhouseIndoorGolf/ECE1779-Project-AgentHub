@@ -70,9 +70,6 @@ def resolve_bash_path(env=None, platform=None, which=None):
     raise RuntimeError("Git Bash was not found. Set GIT_BASH_PATH to the full path of bash.exe.")
 
 
-BASH = resolve_bash_path()
-
-
 def bash_path(path):
     value = Path(path).resolve().as_posix()
     return "/" + value[0].lower() + value[2:] if os.name == "nt" else value
@@ -199,6 +196,14 @@ def fake_docker(args):
     return code
 
 
+# Fake CLI children inherit a rewritten PATH and need no Bash discovery or validation.
+# 模拟 CLI 子进程继承已改写的 PATH，无需查找或验证 Bash。
+if __name__ == "__main__" and sys.argv[1:2] == ["fake-docker"]:
+    sys.exit(fake_docker(sys.argv[2:]))
+
+BASH = resolve_bash_path()
+
+
 @unittest.skipUnless(BASH, "Bash is required")
 class DeploymentTests(unittest.TestCase):
     def setUp(self):
@@ -227,6 +232,8 @@ class DeploymentTests(unittest.TestCase):
         self.env = os.environ.copy()
         for name in ("DOCKER_HOST", "DOCKER_CONTEXT", "BASH_ENV", "ENV"):
             self.env.pop(name, None)
+        # Allow subprocess startup in orchestration tests; deadline tests set shorter budgets.
+        # 编排测试为子进程启动留出余量；截止时间专项测试单独设置短预算。
         self.env.update({
             "TEST_BIN": bash_path(self.bin), "TEST_PYTHON": Path(sys.executable).as_posix(),
             "TEST_DRIVER": Path(__file__).resolve().as_posix(), "FAKE_STATE": str(self.state_path),
@@ -234,19 +241,19 @@ class DeploymentTests(unittest.TestCase):
             "POSTGRES_DATA_PATH": bash_path(self.data), "POSTGRES_DB": "agenthub", "POSTGRES_USER": "agenthub",
             "BOOTSTRAP_USERNAME": "developer", "DB_PASSWORD_SECRET": "offline-db", "BOOTSTRAP_PASSWORD_SECRET": "offline-bootstrap",
             "IMAGE_MODE": "local", "STORAGE_MODE": "directory", "API_REPLICAS": "2", "WORKER_REPLICAS": "2",
-            "API_PUBLISHED_PORT": "18099", "DEPLOY_TIMEOUT": "2", "DEPLOY_LOCK_PATH": bash_path(self.directory / "lock"),
+            "API_PUBLISHED_PORT": "18099", "DEPLOY_TIMEOUT": "10", "DEPLOY_LOCK_PATH": bash_path(self.directory / "lock"),
             "MSYS_NO_PATHCONV": "1", "MSYS2_ARG_CONV_EXCL": "*",
         })
 
     def state(self):
         return json.loads(self.state_path.read_text())
 
-    def run_script(self, script="deploy.sh", mode="--apply", fault=""):
+    def run_script(self, script="deploy.sh", mode="--apply", fault="", timeout=40):
         state = self.state()
         state["fault"] = fault
         self.state_path.write_text(json.dumps(state))
         command = 'export PATH="$TEST_BIN:$PATH"; exec bash "$1" "$2"'
-        return subprocess.run([BASH, "-c", command, "test", bash_path(ROOT / "deploy/scripts" / script), mode], env=self.env, capture_output=True, text=True, timeout=40)
+        return subprocess.run([BASH, "-c", command, "test", bash_path(ROOT / "deploy/scripts" / script), mode], env=self.env, capture_output=True, text=True, timeout=timeout)
 
     def run_health_probe(self, delay, health="healthy", timeout=3):
         docker = self.bin / "docker"
@@ -314,6 +321,100 @@ wait_healthy api 1
             "PROBE_TRACE": str(self.probe_trace),
         }
         return subprocess.run([BASH, "-c", command], env=env, capture_output=True, text=True, timeout=12)
+
+    def run_stop_probe(self, state="shutdown", slow="", simulated=False):
+        # Use a shell fake so timeout covers the actual child process, including sleep.
+        # 使用 shell 模拟命令，让 timeout 覆盖真实子进程及其 sleep。
+        docker = self.bin / "docker"
+        docker.write_text(r'''#!/usr/bin/env bash
+if [[ "$1 $2" == "service ps" ]]; then
+  if [[ $SLOW_QUERY == list ]]; then sleep 30; fi
+  if [[ $TASK_STATE != empty ]]; then printf 'task-1\n'; fi
+elif [[ "$1" == inspect ]]; then
+  if [[ $SLOW_QUERY == inspect ]]; then sleep 30; fi
+  printf '%s\n' "$TASK_STATE"
+else
+  exit 90
+fi
+''', newline="\n")
+        docker.chmod(0o755)
+        command = r'''
+export PATH="$TEST_BIN:$PATH" DEPLOY_TIMEOUT=2
+source "$COMMON_SH"
+'''
+        if simulated:
+            # A late successful query must fail even if the timeout utility returns success.
+            # 即使 timeout 工具返回成功，迟到的查询结果也必须被拒绝。
+            command += r'''
+probe_before_deadline() { shift; "$@"; }
+docker() { command sleep 2; printf 'shutdown\n'; }
+DEPLOY_TIMEOUT=1
+'''
+        command += 'wait_stopped api\nprintf "stopped-before-deadline\\n"\n'
+        env = self.env | {
+            "COMMON_SH": bash_path(ROOT / "deploy/scripts/common.sh"),
+            "TASK_STATE": state, "SLOW_QUERY": slow,
+        }
+        return subprocess.run([BASH, "-c", command], env=env, capture_output=True, text=True, timeout=9)
+
+    def test_wait_stopped_accepts_empty_and_terminal_tasks(self):
+        for state in ("empty", "complete", "shutdown", "failed", "rejected"):
+            with self.subTest(state=state):
+                result = self.run_stop_probe(state=state)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_wait_stopped_rejects_running_and_orphaned_tasks(self):
+        for state in ("running", "orphaned"):
+            with self.subTest(state=state):
+                result = self.run_stop_probe(state=state)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Tasks did not stop", result.stderr)
+
+    def test_wait_stopped_rejects_success_after_deadline(self):
+        result = self.run_stop_probe(simulated=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Tasks did not stop", result.stderr)
+        self.assertNotIn("stopped-before-deadline", result.stdout)
+
+    def test_wait_stopped_bounds_both_docker_queries(self):
+        for query in ("list", "inspect"):
+            with self.subTest(query=query):
+                result = self.run_stop_probe(slow=query)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Tasks did not stop", result.stderr)
+
+    def test_fake_docker_does_not_discover_or_validate_bash(self):
+        # Child CLI mode must work even when the inherited Bash discovery settings are invalid.
+        # 即使继承的 Bash 查找配置无效，子进程 CLI 模式也必须正常工作。
+        env = self.env | {"GIT_BASH_PATH": str(self.directory / "missing-bash.exe"), "PATH": ""}
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "fake-docker", "stack", "config"],
+            env=env, capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.state()["calls"]), 1)
+
+    def test_setup_polling_bounds_list_state_and_exit_queries(self):
+        # Stall in Bash so GNU timeout controls the child on both Linux and Git Bash.
+        # 在 Bash 内阻塞，使 GNU timeout 在 Linux 和 Git Bash 上都能控制子进程。
+        (self.bin / "docker").write_text(r'''#!/usr/bin/env bash
+if grep -q '"launched": true' "$FAKE_STATE"; then
+  case "$STALL_SETUP_QUERY:$*" in
+    list:service\ ps*|state:inspect*Status.State*|exit:inspect*ContainerStatus.ExitCode*) sleep 30 ;;
+  esac
+fi
+exec "$TEST_PYTHON" "$TEST_DRIVER" fake-docker "$@"
+''', newline="\n")
+        for query in ("list", "state", "exit"):
+            with self.subTest(query=query):
+                self.state_path.write_text(json.dumps({"calls": []}))
+                self.env["STALL_SETUP_QUERY"] = query
+                result = self.run_script(timeout=30)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.state().get("apps", False))
+                self.assertTrue(self.state()["setup"])
+                self.assertEqual(len(self.mutations()), 2)
+                self.assertIn("Setup timed out", result.stderr)
 
     def test_wait_healthy_accepts_probe_completed_before_deadline(self):
         result = self.run_simulated_health_probe(delay=0, timeout=10)
@@ -567,6 +668,4 @@ class GitBashDiscoveryTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "fake-docker":
-        sys.exit(fake_docker(sys.argv[2:]))
     unittest.main()
