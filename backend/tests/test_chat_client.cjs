@@ -530,3 +530,60 @@ test("a polled job state is not replaced by an older cached state", async () => 
   client.run("noteJob({ id: 'job-1', status: 'QUEUED', attempts: 1 })");
   assert.equal(client.run("jobStates.get('job-1').status"), "QUEUED");
 });
+
+test("a 401 history refresh stops retrying and asks the user to sign in again", async t => {
+  let stream, historyReads = 0, loginOpened = 0;
+  const client = createClient(async (url, options) => {
+    if (url === "/conversations/chat-a/events") {
+      stream = sseResponse(options.signal);
+      return stream.response;
+    }
+    if (url.includes("/messages?")) {
+      historyReads++;
+      return historyReads < 3 ? response([]) : { ok: false, status: 401 };
+    }
+    if (url === "/conversations") return response([]);
+    throw new Error("Unexpected request: " + url);
+  }, streamingGlobals);
+  t.after(() => client.run("newChat()"));
+  client.element("login-panel").showModal = () => { loginOpened++; };
+  await client.run("authorization = 'Basic test'; openConversation({ id: 'chat-a', title: 'Chat A' })");
+  await until(() => stream);
+  stream.push('id: 0\nevent: ready\ndata: {"cursor":0}\n\n');
+  await until(() => historyReads === 2);
+  stream.push('id: 1\nevent: message\ndata: {"seq":1}\n\n');
+  await until(() => loginOpened === 1);
+  assert.equal(client.run("stream"), null);
+  assert.equal(client.element("notice").textContent, "Your session has expired. Please sign in again.");
+  // The first backoff retry would have fired after one second.
+  // 若仍在退避重试，第一次重试会在一秒后发出。
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  assert.equal(historyReads, 3);
+});
+
+test("a 401 stream asks for sign-in and resumes live updates after signing in", async t => {
+  let opens = 0, loginOpened = 0;
+  const client = createClient(async (url, options) => {
+    if (url === "/conversations/chat-a/events") {
+      opens++;
+      if (opens === 1) return { ok: false, status: 401 };
+      return sseResponse(options.signal).response;
+    }
+    if (url === "/me") return response({ username: "alice" });
+    if (url.includes("/messages?") || url === "/conversations") return response([]);
+    throw new Error("Unexpected request: " + url);
+  }, streamingGlobals);
+  t.after(() => client.run("newChat()"));
+  client.element("login-panel").showModal = () => { loginOpened++; };
+  client.element("login-panel").close = () => {};
+  await client.run("authorization = 'Basic stale'; openConversation({ id: 'chat-a', title: 'Chat A' })");
+  await until(() => loginOpened === 1);
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.equal(opens, 1);
+
+  client.element("username").value = "alice";
+  client.element("password").value = "new-password";
+  await client.element("login-form").listeners.get("submit")({ preventDefault() {} });
+  await until(() => opens === 2);
+  assert.equal(client.element("notice").textContent, "");
+});

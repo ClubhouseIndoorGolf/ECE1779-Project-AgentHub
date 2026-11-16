@@ -187,15 +187,34 @@ function scheduleRefresh(delay = 150, attempt = 0) {
     if (!current || current.conversation !== conversation) return;
     try {
       await renderMessages(awaitingReply);
-    } catch {
+    } catch (error) {
+      if (stream !== current || current.conversation !== conversation) return;
+      // Rejected credentials need a new sign-in; retrying would only repeat the 401 every 10 seconds.
+      // 凭据被拒绝时需要重新登录；继续重试只会每 10 秒重复收到 401。
+      if (error.status === 401) { authExpired(current); return; }
+      // Other client errors will not succeed on retry; transient 5xx, 429 and network errors back off.
+      // 其他客户端错误重试也不会成功；临时的 5xx、429 与网络错误按退避重试。
+      if (error.status >= 400 && error.status < 500 && error.status !== 429) { notice(error.message); return; }
       // A newer event or navigation cancels this retry through clearTimeout or the stream check.
       // 新事件或会话切换会通过 clearTimeout 或事件流检查取消本次重试。
-      if (stream === current && current.conversation === conversation)
-        scheduleRefresh(Math.min(1000 * 2 ** attempt, 10000), attempt + 1);
+      scheduleRefresh(Math.min(1000 * 2 ** attempt, 10000), attempt + 1);
       return;
     }
     listConversations().catch(() => {});
   }, delay);
+}
+
+/** Stop live updates after rejected credentials and ask the user to sign in again.
+ * The draft and conversation stay in memory; a successful sign-in restarts the stream.
+ * 凭据被拒绝后停止实时更新，并提示用户重新登录；草稿与当前会话保留在内存中，登录成功后重新连接。
+ */
+function authExpired(current) {
+  if (stream !== current) return;
+  // stopStream also clears any pending history refresh retry.
+  // stopStream 同时清除待执行的历史刷新重试。
+  stopStream();
+  notice("Your session has expired. Please sign in again.");
+  openLogin();
 }
 
 /** Close the current stream; navigation and sign-out must not keep old account data flowing.
@@ -239,9 +258,10 @@ async function runStream(current) {
       const response = await fetch("/conversations/" + current.conversation + "/events", {
         headers, cache: "no-store", signal: attempt.signal,
       });
-      if (response.status === 401 || response.status === 404) {
-        // Credentials or ownership changed; polling remains available and reports the error.
-        // 凭据或归属已变化；保留轮询路径，由普通请求显示错误。
+      if (response.status === 401) { authExpired(current); return; }
+      if (response.status === 404) {
+        // Ownership changed; polling remains available and reports the error.
+        // 会话归属已变化；保留轮询路径，由普通请求显示错误。
         if (stream === current) { current.live = false; connection(); }
         return;
       }
@@ -682,6 +702,9 @@ $("login-form").addEventListener("submit", async event => {
     $("avatar").textContent = (account.display_name || account.username).slice(0, 2).toUpperCase();
     await listConversations();
     $("login-panel").close();
+    // Resume live updates for a conversation left open when the previous session expired.
+    // 若上次会话过期时仍打开着某个会话，登录后恢复其实时更新。
+    if (conversation) { notice(); startStream(); }
     if (resumeAfterLogin) {
       resumeAfterLogin = false;
       $("message-form").requestSubmit();
