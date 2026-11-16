@@ -1,0 +1,214 @@
+
+version: "3.8"
+
+# Swarm uses registry images, not local Compose builds.
+# Swarm 部署使用已构建的镜像，通常由镜像仓库提供。
+x-app: &app
+  image: ${AGENTHUB_IMAGE:?Set AGENTHUB_IMAGE to a registry image tag or digest}
+  networks: [backend]
+  environment: &app-env
+    PGHOST: db
+    PGPORT: "5432"
+    PGDATABASE: ${POSTGRES_DB:-agenthub}
+    PGUSER: ${POSTGRES_USER:-agenthub}
+    PGCONNECT_TIMEOUT: "5"
+    # Use the fixed provider for local and cloud deployments of this stack.
+    # 此 stack 在本地和云端都使用固定回复提供方。
+    REPLY_MODE: fixed
+  secrets:
+    - source: db_password
+      target: db_password
+  # Adapt secret files to the existing image without changing application code.
+  # 从 Swarm 密钥文件读取密码，并通过现有应用镜像支持的环境变量传入。
+  entrypoint:
+    - /bin/sh
+    - -ec
+    - 'export PGPASSWORD="$$(cat /run/secrets/db_password)"; test -n "$$PGPASSWORD"; exec "$$@"'
+    - --
+
+# Share scheduling preferences and resource budgets across application services.
+# 统一各应用服务的调度偏好和资源预算。
+x-app-deploy: &app-deploy
+  mode: replicated
+  endpoint_mode: vip
+  placement:
+    constraints: [node.platform.os == linux]
+    preferences:
+      - spread: node.labels.agenthub.node
+  restart_policy:
+    condition: any
+    delay: 5s
+  # Start replacements one at a time and pause the rollout on failure.
+  # 每次启动一个替换副本，更新失败时暂停发布。
+  update_config:
+    parallelism: 1
+    delay: 10s
+    order: start-first
+    failure_action: pause
+    monitor: 150s
+    max_failure_ratio: 0
+  resources:
+    reservations:
+      cpus: "0.10"
+      memory: 128M
+    limits:
+      cpus: "1.0"
+      memory: 512M
+
+services:
+  db:
+    image: ${POSTGRES_IMAGE:?Set POSTGRES_IMAGE to a PostgreSQL 17 tag or digest}
+    networks: [backend]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-agenthub}
+      POSTGRES_USER: ${POSTGRES_USER:-agenthub}
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      TZ: UTC
+    secrets:
+      - source: db_password
+        target: db_password
+    # Store PostgreSQL files on a directory managed by the database node.
+    # 将 PostgreSQL 文件保存在数据库节点管理的目录中。
+    volumes:
+      - type: bind
+        source: ${POSTGRES_DATA_PATH:?Set POSTGRES_DATA_PATH to the mounted Volume data directory}
+        target: /var/lib/postgresql/data
+    # Probe the PostgreSQL listener from inside its container.
+    # 在容器内检查 PostgreSQL 是否已开始接受连接。
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -h 127.0.0.1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    stop_grace_period: 60s
+    deploy:
+      mode: replicated
+      replicas: 1
+      endpoint_mode: vip
+      # Pin the database to the node that owns its storage.
+      # 将数据库固定调度到持有数据目录的节点。
+      placement:
+        constraints:
+          - node.platform.os == linux
+          - node.labels.agenthub.db == true
+      restart_policy:
+        condition: any
+        delay: 5s
+      # Never run two PostgreSQL tasks against the same data directory.
+      # 先停止旧任务再启动新任务，避免两个 PostgreSQL 任务同时访问同一数据目录。
+      update_config:
+        parallelism: 1
+        order: stop-first
+        failure_action: pause
+        monitor: 120s
+      resources:
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  # Scale this service to one only after database readiness, then verify exit 0.
+  # 数据库就绪后才将此服务扩为一个副本，并确认任务以退出码 0 完成。
+  setup:
+    <<: *app
+    environment:
+      <<: *app-env
+      BOOTSTRAP_USERNAME: ${BOOTSTRAP_USERNAME:-developer}
+    secrets:
+      - source: db_password
+        target: db_password
+      - source: bootstrap_password
+        target: bootstrap_password
+    # Apply all schema revisions before running account bootstrap.
+    # 先应用全部数据库迁移，再执行账号初始化。
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        export BOOTSTRAP_PASSWORD="$$(cat /run/secrets/bootstrap_password)"
+        test -n "$$BOOTSTRAP_PASSWORD"
+        alembic upgrade head
+        exec python -m app.manage bootstrap
+    healthcheck:
+      disable: true
+    deploy:
+      <<: *app-deploy
+      # A deployment operator or script explicitly launches each setup run.
+      # 每次 setup 都由部署操作者或脚本显式启动。
+      replicas: 0
+      restart_policy:
+        condition: none
+      update_config:
+        parallelism: 1
+        order: stop-first
+        failure_action: pause
+
+  api:
+    <<: *app
+    command: [uvicorn, app.main:app, --host, 0.0.0.0, --port, "8000"]
+    ports:
+      # The routing mesh publishes this port on every Swarm node.
+      # Swarm 路由网格在每个节点上发布此端口。
+      - target: 8000
+        published: ${API_PUBLISHED_PORT:-18000}
+        protocol: tcp
+        mode: ingress
+    # Check the HTTP server from within the task so routing cannot mask an unhealthy replica.
+    # 在任务容器内检查 HTTP 服务，避免路由转发掩盖单个副本异常。
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    stop_grace_period: 45s
+    deploy:
+      <<: *app-deploy
+      replicas: ${API_REPLICAS:-2}
+
+  worker:
+    <<: *app
+    environment:
+      <<: *app-env
+      # Configure how often the worker polls, how long it holds a lease, and how many attempts it makes.
+      # 配置 worker 的轮询频率、租约期限和任务尝试次数上限。
+      WORKER_POLL_SECONDS: "1"
+      WORKER_LEASE_SECONDS: "60"
+      WORKER_MAX_ATTEMPTS: "3"
+    command: [python, -m, app.worker]
+    # This checks database access, not worker progress; use the smoke job for that.
+    # 此探针检查数据库访问。任务处理进度需通过冒烟测试验证。
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          export PGPASSWORD="$$(cat /run/secrets/db_password)";
+          exec python -c "from app.db import engine; from sqlalchemy import text;
+          connection = engine.connect(); connection.execute(text('SELECT 1')); connection.close()"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    stop_grace_period: 45s
+    deploy:
+      <<: *app-deploy
+      replicas: ${WORKER_REPLICAS:-2}
+
+# Give the services a shared network across Swarm nodes.
+# 为所有服务提供跨 Swarm 节点的共享网络。
+networks:
+  backend:
+    driver: overlay
+
+# Look up credentials that operators have already created in Swarm.
+# 引用操作者已在 Swarm 中创建的凭据。
+secrets:
+  db_password:
+    external: true
+    name: ${DB_PASSWORD_SECRET:?Set DB_PASSWORD_SECRET to an existing Swarm secret name}
+  bootstrap_password:
+    external: true
+    name: ${BOOTSTRAP_PASSWORD_SECRET:?Set BOOTSTRAP_PASSWORD_SECRET to an existing Swarm secret name}
