@@ -4,9 +4,10 @@
 import logging
 import os
 from pathlib import Path
+from typing import Literal
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -15,14 +16,38 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal, engine, get_session
-from app.events import ConversationStream, conversation_events, parse_last_event_id
-from app.history import read_history
-from app.models import Conversation, Execution, Job, Message, ProposalDecision, ResolutionProposal, User
+from app.event_store import (
+    EventToAppend,
+    append_events,
+    job_status_event,
+    message_created_event,
+    read_event_head,
+)
+from app.events import (
+    ConversationStream,
+    DurableConversationStream,
+    conversation_events,
+    durable_cursor,
+    parse_durable_cursor,
+    parse_last_event_id,
+)
+from app.history import read_history, read_history_snapshot
+from app.models import (
+    Conversation,
+    ConversationEventHead,
+    Execution,
+    Job,
+    Message,
+    ProposalDecision,
+    ResolutionProposal,
+    User,
+)
 from app.resolution_workflow import (
     EXPIRED_REPLY,
     PROPOSAL_VERSION,
     active_resolution_exists,
     close_proposal,
+    invalidate_proposal,
     unfinished_turn_before,
 )
 from app.schemas import (
@@ -98,13 +123,16 @@ def me(user: User = Depends(current_user)):
 def create_conversation(
     payload: ConversationCreate, user: User = Depends(current_user), session: Session = Depends(get_session)
 ):
-    """Create a conversation owned by the authenticated user in one short transaction.
-    在短事务中创建属于已验证用户的会话，所有权由认证结果确定。
+    """Create an owned conversation and its zero event cursor in one transaction.
+    在同一事务中为已验证用户创建会话及初始值为零的事件游标。
     """
     with session.begin():
         conversation = Conversation(user_id=user.id, title=payload.title)
         session.add(conversation)
         session.flush()
+        # The generated conversation ID must exist before its event counter can reference it.
+        # 必须先写入会话编号，事件计数器才能引用它。
+        session.add(ConversationEventHead(conversation_id=conversation.id))
     return conversation
 
 
@@ -145,8 +173,8 @@ def submit_message(
     user: User = Depends(current_user),
     session: Session = Depends(get_session),
 ):
-    """Atomically save one logical message and job, returning stable IDs for identical retries.
-    原子保存一条逻辑消息及其任务；相同内容和去重标识的重试始终返回原有编号。
+    """Atomically save the message, job and their events, with stable IDs for retries.
+    原子保存消息、待办及其事件，重复提交返回原有编号。
     """
     with session.begin():
         # Ownership and sequence allocation share a row lock with worker completion.
@@ -192,6 +220,9 @@ def submit_message(
         job = Job(source_message_id=message.id)
         session.add(job)
         session.flush()
+        # Only a new submission reaches this point. Record the message before its queued job.
+        # 只有新提交会到达这里。先记录消息，再记录对应待办入队。
+        append_events(session, conversation.id, [message_created_event(message), job_status_event(job)])
         result = SubmissionOut(message_id=message.id, job_id=job.id)
     return result
 
@@ -202,25 +233,50 @@ def submit_message(
     "/conversations/{conversation_id}/messages",
     response_model=list[MessageOut],
     response_model_exclude_unset=True,
-    description="Read your conversation's messages and any attached proposals. Use after_seq and limit for pagination.",
+    description=(
+        "Read your conversation's messages and attached proposals. The first page (after_seq=0) includes "
+        "an X-Conversation-Event-Cursor header for durable SSE. Use after_seq and limit for pagination."
+    ),
+    responses={
+        200: {
+            "headers": {
+                "X-Conversation-Event-Cursor": {
+                    "description": "Durable SSE cursor from the first page's database snapshot.",
+                    "schema": {"type": "string", "example": "v2:42"},
+                }
+            }
+        }
+    },
 )
 def list_messages(
     conversation_id: UUID,
+    response: Response,
     after_seq: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
     user: User = Depends(current_user),
     session: Session = Depends(get_session),
 ):
-    """Read owned message pages with proposals attached to their source messages.
-    分页读取当前账号的消息，并在来源消息上附带对应的方案。
+    """Return the owned message page and attach a durable cursor to the first page.
+    返回当前账号的消息页，并为首屏附加持久化事件游标。
     """
+    first_page = after_seq == 0
+    if first_page:
+        # Configure isolation before the first SQL statement on this request session.
+        # 在请求会话的第一条 SQL 执行前设置隔离级别。
+        session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
     conversation = session.scalar(
         select(Conversation).where(Conversation.id == conversation_id, Conversation.user_id == user.id)
     )
     if not conversation:
         raise HTTPException(404, "Conversation not found")
-    # Read messages and any attached proposals in one snapshot; the event stream shares this shape.
-    # 在同一快照中读取消息及其附带方案；实时事件流复用相同的数据结构。
+    if first_page:
+        # Read the page and its cursor in the same snapshot so events cannot slip between them.
+        # 在同一快照中读出首屏与游标，防止遗漏两次读取之间提交的事件。
+        messages, seq = read_history_snapshot(session, conversation_id, limit)
+        if seq is None:
+            raise HTTPException(503, "Conversation events temporarily unavailable")
+        response.headers["X-Conversation-Event-Cursor"] = durable_cursor(seq)
+        return messages
     return read_history(session, conversation_id, after_seq, limit)
 
 
@@ -233,11 +289,13 @@ def list_messages(
     description=(
         "Stream your conversation's new messages, job status changes and proposal status changes as "
         "Server-Sent Events. Send Last-Event-ID with the last message sequence received to replay later messages."
+        " With version=2, provide a v2:<sequence> cursor to replay committed conversation events."
     ),
 )
 async def stream_events(
     conversation_id: UUID,
     request: Request,
+    version: Literal["1", "2"] = "1",
     last_event_id: str | None = Header(None, alias="Last-Event-ID"),
     user: User = Depends(current_user),
 ):
@@ -245,20 +303,34 @@ async def stream_events(
     在短会话中完成授权；之后每次轮询各自打开只读会话，流期间不长期占用数据库连接。
     """
 
-    def owned() -> bool:
+    def open_stream() -> ConversationStream | DurableConversationStream:
+        """Check ownership and validate the cursor before returning a stream reader.
+        校验会话归属和游标后，再返回事件流读取器。
+        """
         with SessionLocal() as session:
-            return (
-                session.scalar(
-                    select(Conversation.id).where(
-                        Conversation.id == conversation_id, Conversation.user_id == user.id
-                    )
+            owned = session.scalar(
+                select(Conversation.id).where(
+                    Conversation.id == conversation_id, Conversation.user_id == user.id
                 )
-                is not None
             )
+            if owned is None:
+                raise HTTPException(404, "Conversation not found")
+            if version == "1":
+                return ConversationStream(conversation_id, parse_last_event_id(last_event_id))
 
-    if not await run_in_threadpool(owned):
-        raise HTTPException(404, "Conversation not found")
-    stream = ConversationStream(conversation_id, parse_last_event_id(last_event_id))
+            # Check the versioned cursor against the committed head of this conversation.
+            # 将新版游标与当前会话已提交的最新事件序号比较。
+            seq = parse_durable_cursor(last_event_id)
+            if seq is None:
+                raise HTTPException(422, "Invalid conversation event cursor")
+            head = read_event_head(session, conversation_id)
+            if head is None:
+                raise HTTPException(503, "Conversation events temporarily unavailable")
+            if seq > head:
+                raise HTTPException(422, "Conversation event cursor is ahead of the stream")
+            return DurableConversationStream(conversation_id, seq)
+
+    stream = await run_in_threadpool(open_stream)
     return StreamingResponse(
         conversation_events(stream, request.is_disconnected),
         media_type="text/event-stream",
@@ -275,8 +347,8 @@ def decide_proposal(
     user: User = Depends(current_user),
     session: Session = Depends(get_session),
 ):
-    """Record one human decision and enqueue an approved continuation atomically.
-    原子保存一份人工决定，并在批准时加入恢复待办。
+    """Persist a human decision, its events and any approved continuation atomically.
+    原子保存人工决定、对应事件和获批的恢复待办。
     """
     with session.begin():
         # Serialize decisions with message submissions and final replies in the same conversation.
@@ -313,7 +385,10 @@ def decide_proposal(
             )
         now = session.scalar(select(func.clock_timestamp()))
         if now >= proposal.expires_at:
-            close_proposal(session, conversation, execution, "INVALIDATED", EXPIRED_REPLY)
+            events = invalidate_proposal(
+                session, conversation, execution, proposal.id, "EXPIRED", EXPIRED_REPLY
+            )
+            append_events(session, conversation.id, events)
         else:
             # Only approval queues work. Rejection records a final reply without business writes.
             # 只有批准才入队。拒绝仅保存最终回复，不写入业务数据。
@@ -324,10 +399,12 @@ def decide_proposal(
                 session.flush([job])
                 execution.status = "APPROVED"
                 conversation.updated_at = now
+                followup = job_status_event(job)
             else:
-                close_proposal(
+                message = close_proposal(
                     session, conversation, execution, "REJECTED", "The refund proposal was rejected."
                 )
+                followup = message_created_event(message)
             decision = ProposalDecision(
                 proposal_id=proposal.id,
                 user_id=user.id,
@@ -336,6 +413,20 @@ def decide_proposal(
                 resume_job_id=job.id if job else None,
             )
             session.add(decision)
+            # The decision precedes the continuation or final reply in the event log.
+            # 在事件日志中，先记录决定，再记录恢复待办或最终回复。
+            decision_event = EventToAppend(
+                "proposal.decided",
+                {
+                    "proposal_id": str(proposal.id),
+                    "execution_id": str(execution.id),
+                    "source_message_id": str(execution.source_message_id),
+                    "decision": decision.decision,
+                    "status": "QUEUED" if job else "REJECTED",
+                    "resume_job_id": str(job.id) if job else None,
+                },
+            )
+            append_events(session, conversation.id, [decision_event, followup])
             return ProposalDecisionOut.model_validate(decision)
 
     # Commit the expiration and its reply before returning the conflict to the client.

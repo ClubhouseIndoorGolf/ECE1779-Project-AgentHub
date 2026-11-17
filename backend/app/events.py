@@ -1,5 +1,5 @@
-# Stream conversation changes as Server-Sent Events by reading committed rows; no schema change is needed.
-# 通过读取已提交的数据行，以 Server-Sent Events 推送会话变化；无需修改数据库结构。
+# Stream legacy updates or replay committed conversation events over SSE.
+# 通过 SSE 推送旧版状态更新，或回放已提交的会话事件。
 
 import asyncio
 import json
@@ -15,9 +15,10 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.db import SessionLocal
+from app.event_store import MAX_EVENT_PAGE_SIZE, MAX_EVENT_SEQ, read_events
 from app.history import read_history, read_proposals
 from app.models import Job, Message
-from app.schemas import JobEventOut
+from app.schemas import ConversationEventOut, JobEventOut
 
 log = logging.getLogger(__name__)
 
@@ -31,13 +32,13 @@ MAX_STREAM_SECONDS = 300.0
 # Rows committed slightly after their timestamp was taken must still be seen by the next poll.
 # 时间戳取得后稍晚才提交的行，仍需在下一次查询中被看到。
 JOB_LOOKBACK = timedelta(seconds=5)
-REPLAY_PAGE = 500
+REPLAY_PAGE = MAX_EVENT_PAGE_SIZE
 ACTIVE_JOB_STATES = ("QUEUED", "RUNNING")
 LAST_EVENT_ID = re.compile(r"[0-9]{1,19}")
-MAX_SEQ = 2**63 - 1
+DURABLE_EVENT_ID = re.compile(r"v2:([0-9]{1,19})")
 
 
-def encode(event: str, data: str, event_id: int | None = None) -> str:
+def encode(event: str, data: str, event_id: int | str | None = None) -> str:
     """Format one SSE frame; JSON data never contains raw newlines.
     格式化单个 SSE 帧；JSON 数据中不会出现原始换行符。
     """
@@ -54,7 +55,22 @@ def parse_last_event_id(value: str | None) -> int | None:
     if value is None or not LAST_EVENT_ID.fullmatch(value.strip()):
         return None
     seq = int(value.strip())
-    return seq if seq <= MAX_SEQ else None
+    return seq if seq <= MAX_EVENT_SEQ else None
+
+
+def durable_cursor(seq: int) -> str:
+    """Format a durable event cursor distinct from the legacy numeric message cursor.
+    为持久化事件生成带版本标记的游标，与旧版数字消息游标区分。
+    """
+    return f"v2:{seq}"
+
+
+def parse_durable_cursor(value: str | None) -> int | None:
+    """Read the versioned cursor without reinterpreting a legacy message sequence.
+    读取带版本标记的游标，避免将旧版消息序号误作事件序号。
+    """
+    match = DURABLE_EVENT_ID.fullmatch(value.strip()) if value is not None else None
+    return parse_last_event_id(match[1]) if match is not None else None
 
 
 class ConversationStream:
@@ -128,7 +144,52 @@ class ConversationStream:
         return frames
 
 
-async def conversation_events(stream: ConversationStream, is_disconnected) -> AsyncIterator[str]:
+class DurableConversationStream:
+    """Read one bounded page from the event log for an authorized conversation.
+    为授权会话从事件日志读取一页有数量上限的记录。
+    """
+
+    def __init__(self, conversation_id: UUID, last_seq: int):
+        """Start from the validated exclusive cursor supplied by the client.
+        从客户端提供并已通过校验的排他游标开始回放。
+        """
+        self.conversation_id = conversation_id
+        self.last_seq = last_seq
+        self.started = False
+        self.page_full = False
+
+    def poll(self) -> list[str]:
+        """Emit stored payloads as recorded, then advance the server's next read position.
+        原样发出已保存的事件载荷，再推进服务端的读取位置。
+        """
+        frames: list[str] = []
+        # The ready frame confirms the resume point without changing the client's cursor.
+        # ready 帧确认续传起点，不改变客户端的游标。
+        if not self.started:
+            frames.append(encode("ready", json.dumps({"cursor": durable_cursor(self.last_seq)})))
+            self.started = True
+
+        # Read only one page per session. A full page can be followed immediately by another read.
+        # 每次数据库会话只读一页。读满一页后可以立即继续读取。
+        with SessionLocal() as session:
+            rows = read_events(session, self.conversation_id, self.last_seq, REPLAY_PAGE)
+        for row in rows:
+            event = ConversationEventOut(
+                seq=str(row.seq),
+                type=row.event_type,
+                conversation_id=row.conversation_id,
+                created_at=row.created_at,
+                payload=row.payload,
+            )
+            frames.append(encode(event.type, event.model_dump_json(), durable_cursor(row.seq)))
+            self.last_seq = row.seq
+        self.page_full = len(rows) == REPLAY_PAGE
+        return frames
+
+
+async def conversation_events(
+    stream: ConversationStream | DurableConversationStream, is_disconnected
+) -> AsyncIterator[str]:
     """Yield frames until the client leaves, the stream reaches its lifetime, or the database fails.
     持续输出事件帧，直到客户端断开、流达到最长时长或数据库出错。
     """
@@ -156,4 +217,8 @@ async def conversation_events(stream: ConversationStream, is_disconnected) -> As
             # 注释行用于防止代理关闭空闲连接。
             yield ": keepalive\n\n"
             last_sent = time.monotonic()
+        # Drain durable backlogs promptly without keeping a long database session.
+        # 快速补发持久化积压事件，同时避免长期占用数据库会话。
+        if isinstance(stream, DurableConversationStream) and stream.page_full:
+            continue
         await asyncio.sleep(POLL_SECONDS)

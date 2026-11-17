@@ -4,12 +4,16 @@
 import json
 import threading
 import time
-from uuid import uuid4
+from concurrent.futures import ThreadPoolExecutor
+from uuid import UUID, uuid4
 
 import pytest
 
-from app import events
+from app import events, history
+from app.db import SessionLocal
+from app.event_store import EventToAppend, append_events
 from app.manage import seed_demo_orders
+from app.models import ConversationEventHead
 from app.worker import run_once
 
 
@@ -56,12 +60,13 @@ def named(frames, event):
     return [(event_id, data) for name, event_id, data in frames if name == event]
 
 
-def test_stream_requires_owner(client):
+@pytest.mark.parametrize("version", ["1", "2"])
+def test_stream_requires_owner(client, version):
     """Another account and anonymous requests cannot open the stream.
     其他账号与未认证请求都不能打开事件流。
     """
     conversation = client.post("/conversations", json={}).json()["id"]
-    url = f"/conversations/{conversation}/events"
+    url = f"/conversations/{conversation}/events?version={version}"
     assert client.get(url, auth=("bob", "bob-test-password")).status_code == 404
     client.auth = None
     assert client.get(url).status_code == 401
@@ -183,3 +188,147 @@ def test_unicode_last_event_id_starts_fresh(client):
         "1",
         {"cursor": 1},
     )
+
+
+def test_durable_history_cursor_is_only_on_the_first_page(client):
+    """Expose the event head on a fresh snapshot while retaining the history list shape.
+    为新快照附加事件游标，同时保持历史响应为列表。
+    """
+    conversation = client.post("/conversations", json={}).json()["id"]
+    url = f"/conversations/{conversation}/messages"
+    empty_page = client.get(url)
+    assert empty_page.status_code == 200 and empty_page.json() == []
+    assert empty_page.headers["X-Conversation-Event-Cursor"] == "v2:0"
+    assert client.post(url, json={"content": "Hello", "submission_key": str(uuid4())}).status_code == 202
+    assert run_once("snapshot-worker")
+
+    # The event head covers the snapshot, even when more messages need to be paged in.
+    # 即使还需要翻页，事件游标也对应整个会话的当前快照。
+    first = client.get(url, params={"limit": 1})
+    assert first.headers["X-Conversation-Event-Cursor"] == "v2:5"
+    assert [row["seq"] for row in first.json()] == [1]
+    more = client.get(url, params={"after_seq": 1, "limit": 1})
+    assert "X-Conversation-Event-Cursor" not in more.headers
+    assert [row["seq"] for row in more.json()] == [2]
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    [None, "0", "v2:", "v2:-1", b"v2:\xb2", "v2:9223372036854775808", "v2:1"],
+)
+def test_invalid_durable_cursor_returns_422_before_streaming(client, cursor):
+    """Reject legacy, malformed, and future cursors in the durable endpoint.
+    在新版接口拒绝旧版、格式错误和超前的游标。
+    """
+    conversation = client.post("/conversations", json={}).json()["id"]
+    headers = {} if cursor is None else {"Last-Event-ID": cursor}
+    response = client.get(f"/conversations/{conversation}/events?version=2", headers=headers)
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith("application/json")
+
+
+def test_durable_stream_paginates_and_resumes_exclusively(client, monkeypatch):
+    """Replay each stored event in order, then resume after the last complete frame.
+    按顺序回放每条已保存的事件，再从最后一条完整帧之后续传。
+    """
+    monkeypatch.setattr(events, "REPLAY_PAGE", 2)
+    conversation, _, _ = submit(client, content="你好 👋")
+    assert run_once("replay-worker")
+    frames = read_stream(client, conversation, "v2:0", params={"version": "2"})
+    assert frames[0] == ("ready", None, {"cursor": "v2:0"})
+    durable = frames[1:]
+    assert [(name, cursor) for name, cursor, _ in durable] == [
+        ("message.created", "v2:1"),
+        ("job.status_changed", "v2:2"),
+        ("job.status_changed", "v2:3"),
+        ("message.created", "v2:4"),
+        ("job.status_changed", "v2:5"),
+    ]
+    for seq, (name, _, data) in enumerate(durable, start=1):
+        assert (data["seq"], data["type"], data["conversation_id"]) == (str(seq), name, conversation)
+        assert data["created_at"]
+    assert [data["payload"]["status"] for _, data in named(frames, "job.status_changed")] == [
+        "QUEUED",
+        "RUNNING",
+        "SUCCEEDED",
+    ]
+    assert durable[0][2]["payload"]["message_seq"] == 1
+    assert "content" not in durable[0][2]["payload"]
+    resumed = read_stream(client, conversation, durable[2][1], params={"version": "2"})
+    assert resumed == [("ready", None, {"cursor": "v2:3"}), *durable[3:]]
+
+
+def test_durable_cursor_keeps_bigint_precision(client):
+    """Use strings for the cursor and sequence even at the PostgreSQL limit.
+    即使达到 PostgreSQL 序号上限，也以字符串传输游标和序号。
+    """
+    conversation = client.post("/conversations", json={}).json()["id"]
+    high = 2**63 - 1
+    with SessionLocal.begin() as session:
+        session.get(ConversationEventHead, UUID(conversation)).last_event_seq = high - 1
+        append_events(session, UUID(conversation), [EventToAppend("proposal.created", {})])
+
+    response = client.get(f"/conversations/{conversation}/messages")
+    assert response.headers["X-Conversation-Event-Cursor"] == f"v2:{high}"
+    frames = read_stream(client, conversation, f"v2:{high - 1}", params={"version": "2"})
+    [(cursor, data)] = named(frames, "proposal.created")
+    assert (cursor, data["seq"]) == (f"v2:{high}", str(high))
+
+
+def test_approval_during_history_snapshot_and_before_connect_is_replayed(client, monkeypatch):
+    """Commit approval between the history and cursor reads, then replay it with the resolution.
+    在历史读取与游标读取之间提交审批，再回放审批及执行结果。
+    """
+    seed_demo_orders("alice", "bob", with_tickets=True)
+    conversation, _, _ = submit(client, content="处理工单 391，符合条件就准备退款")
+    assert run_once("snapshot-worker")
+    url = f"/conversations/{conversation}/messages"
+    proposal = client.get(url).json()[0]["proposal"]
+    page_read = threading.Event()
+    allow_cursor_read = threading.Event()
+    original_read_history = history.read_history
+
+    def pause_after_history(*args):
+        """Stop after the page query so a separate transaction can submit the approval.
+        在历史页查询后暂停，让独立事务提交审批。
+        """
+        page = original_read_history(*args)
+        page_read.set()
+        assert allow_cursor_read.wait(timeout=5)
+        return page
+
+    with monkeypatch.context() as snapshot_patch, ThreadPoolExecutor(max_workers=1) as pool:
+        snapshot_patch.setattr(history, "read_history", pause_after_history)
+        future = pool.submit(client.get, url)
+        try:
+            assert page_read.wait(timeout=5)
+            decision = client.post(
+                f"/proposals/{proposal['id']}/decision",
+                json={"decision": "APPROVE", "version": proposal["version"]},
+            )
+            assert decision.status_code == 200, decision.text
+        finally:
+            allow_cursor_read.set()
+        snapshot = future.result(timeout=5)
+
+    assert snapshot.status_code == 200
+    assert snapshot.json()[0]["proposal"]["status"] == "WAITING_FOR_APPROVAL"
+    cursor = snapshot.headers["X-Conversation-Event-Cursor"]
+    assert cursor == "v2:5"
+    assert run_once("resolution-worker")
+
+    # Complete the refund before opening the stream. Replay still exposes the original decision and progress.
+    # 开流前完成退款，回放仍应呈现原始审批决定和执行进度。
+    frames = read_stream(client, conversation, cursor, params={"version": "2"})
+    assert [(name, event_id) for name, event_id, _ in frames] == [
+        ("ready", None),
+        ("proposal.decided", "v2:6"),
+        ("job.status_changed", "v2:7"),
+        ("job.status_changed", "v2:8"),
+        ("resolution.completed", "v2:9"),
+        ("message.created", "v2:10"),
+        ("job.status_changed", "v2:11"),
+    ]
+    assert frames[1][2]["payload"]["decision"] == "APPROVE"
+    assert frames[3][2]["payload"]["status"] == "RUNNING"
+    assert frames[4][2]["payload"]["status"] == "COMPLETED"

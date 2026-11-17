@@ -5,6 +5,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
+from threading import Event
 from uuid import UUID, uuid4
 
 import pytest
@@ -14,10 +15,19 @@ from sqlalchemy import event, func, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.db import SessionLocal, engine
+from app.event_store import read_event_head, read_events
 from app.manage import seed_demo_orders
-from app.models import AppliedResolution, Job, Order, ProposalDecision, ResolutionProposal, Ticket
+from app.models import (
+    AppliedResolution,
+    ConversationEventHead,
+    Job,
+    Order,
+    ProposalDecision,
+    ResolutionProposal,
+    Ticket,
+)
 from app.support_workflow import PrepareRefund, prepare_refund
-from app.worker import LostLease, claim_job, complete_job, run_once
+from app.worker import LostLease, claim_job, complete_job, fail_job, run_once
 
 
 @pytest.fixture
@@ -109,6 +119,33 @@ def test_approved_resolution_preserves_receipts_and_applies_exact_draft(client, 
         assert (action.order_id, action.ticket_id, action.refund_amount_minor) == (1001, 391, 12999)
         assert action.customer_reply == proposal["customer_reply"]
         assert session.get(Ticket, 391).status == "RESOLVED"
+        # A successful refund publishes its decision and final results once, in causal order.
+        # 成功退款按因果顺序记录一次审批决定和最终结果。
+        events = read_events(session, UUID(messages[0]["conversation_id"]))
+        assert [(row.seq, row.event_type) for row in events] == list(
+            enumerate(
+                [
+                    "message.created",
+                    "job.status_changed",
+                    "job.status_changed",
+                    "proposal.created",
+                    "job.status_changed",
+                    "proposal.decided",
+                    "job.status_changed",
+                    "job.status_changed",
+                    "resolution.completed",
+                    "message.created",
+                    "job.status_changed",
+                ],
+                start=1,
+            )
+        )
+        assert events[3].payload["proposal_id"] == proposal["id"]
+        assert events[5].payload["decision"] == "APPROVE"
+        assert events[5].payload["resume_job_id"] == decision["resume_job_id"]
+        assert events[8].payload["proposal_id"] == proposal["id"]
+        assert events[9].payload["message_id"] == messages[1]["id"]
+        assert events[10].payload["status"] == "SUCCEEDED"
 
     other, _, _ = submit(client, "Can order 1001 be refunded?")
     assert run_once("lookup-worker")
@@ -138,7 +175,7 @@ def test_concurrent_decisions_create_one_receipt(client, demo_tickets, second_de
     """Serialize identical retries and opposing decisions under the conversation lock.
     在会话锁保护下串行处理相同重试及相反决定。
     """
-    _, _, _, proposal = plan(client)
+    path, _, _, proposal = plan(client)
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(decide, client, proposal, "APPROVE")
         second = pool.submit(decide, client, proposal, second_decision)
@@ -152,6 +189,49 @@ def test_concurrent_decisions_create_one_receipt(client, demo_tickets, second_de
         saved = session.scalars(select(ProposalDecision)).one()
         resumes = session.scalars(select(Job).where(Job.kind == "RESUME_EXECUTION")).all()
         assert len(resumes) == int(saved.decision == "APPROVE")
+        conversation_id = UUID(path.split("/")[2])
+        decisions = [
+            row.payload
+            for row in read_events(session, conversation_id)
+            if row.event_type == "proposal.decided"
+        ]
+        assert len(decisions) == 1
+        assert decisions[0]["decision"] == saved.decision
+        assert decisions[0]["resume_job_id"] == (str(saved.resume_job_id) if saved.resume_job_id else None)
+
+
+def test_approval_rolls_back_if_event_batch_cannot_be_saved(client, demo_tickets):
+    """Keep the proposal waiting when its approval and event batch cannot commit.
+    审批和事件批次无法提交时，让方案继续等待审批。
+    """
+    path, _, _, proposal = plan(client)
+    conversation_id = UUID(path.split("/")[2])
+    with SessionLocal() as session:
+        before = read_event_head(session, conversation_id)
+
+    def fail_event_insert(_conn, _cursor, statement, _parameters, _context, _executemany):
+        """Fail after the decision and queued job flush, but before event insertion.
+        在决定与排队待办写入事务之后、事件插入之前注入失败。
+        """
+        if statement.startswith("INSERT INTO conversation_events"):
+            raise SQLAlchemyError("simulated event write failure")
+
+    event.listen(engine, "before_cursor_execute", fail_event_insert)
+    try:
+        assert decide(client, proposal).status_code == 503
+    finally:
+        event.remove(engine, "before_cursor_execute", fail_event_insert)
+    with SessionLocal() as session:
+        assert read_event_head(session, conversation_id) == before
+        assert read_events(session, conversation_id, after_seq=before) == []
+        assert session.scalars(select(ProposalDecision)).first() is None
+        assert session.scalars(select(Job).where(Job.kind == "RESUME_EXECUTION")).first() is None
+    assert client.get(path).json()[0]["proposal"]["status"] == "WAITING_FOR_APPROVAL"
+    assert decide(client, proposal).status_code == 200
+    with SessionLocal() as session:
+        decision, job = read_events(session, conversation_id, after_seq=before)
+        assert decision.seq == before + 1 and decision.event_type == "proposal.decided"
+        assert job.payload["status"] == "QUEUED"
 
 
 @pytest.mark.parametrize("change", ["expired_before_approval", "expired_after_approval", "changed_order"])
@@ -173,10 +253,18 @@ def test_expired_or_changed_proposal_never_writes_business_data(client, demo_tic
                 session.get(Order, 1001).paid_total_minor = 13000
         assert run_once("apply-worker")
         assert decide(client, proposal).json() == response.json()
-    assert client.get(path).json()[0]["proposal"]["status"] == "INVALIDATED"
+    source = client.get(path).json()[0]
+    assert source["proposal"]["status"] == "INVALIDATED"
     with SessionLocal() as session:
         assert session.get(Ticket, 391).status == "OPEN"
         assert session.scalars(select(AppliedResolution)).first() is None
+        rows = read_events(session, UUID(source["conversation_id"]))
+        outcomes = [row for row in rows if row.event_type.startswith("resolution.")]
+        assert len(outcomes) == 1
+        assert outcomes[0].event_type == "resolution.invalidated"
+        assert outcomes[0].payload["reason"] == (
+            "BUSINESS_STATE_CHANGED" if change == "changed_order" else "EXPIRED"
+        )
 
 
 @pytest.mark.parametrize("release", ["approve", "expire"])
@@ -215,12 +303,10 @@ def test_upgraded_pending_proposals_finalize_in_source_order(client, demo_ticket
     # 复现仅支持方案准备的版本，两个来源待办都可在审批前完成。
     with SessionLocal.begin() as session:
         for receipt, ticket_id in [(first, 391), (second, 396)]:
-            assert (
-                prepare_refund(
-                    session, UUID(receipt["message_id"]), accounts[0], PrepareRefund(ticket_id=ticket_id)
-                )
-                is None
+            proposal = prepare_refund(
+                session, UUID(receipt["message_id"]), accounts[0], PrepareRefund(ticket_id=ticket_id)
             )
+            assert isinstance(proposal, ResolutionProposal)
             job = session.get(Job, UUID(receipt["job_id"]))
             job.status = "SUCCEEDED"
             job.attempts = 1
@@ -275,7 +361,9 @@ def test_worker_takeover_rolls_back_partial_resolution(client, demo_tickets):
     拒绝过期租约，并在待办完成失败时回滚全部业务变更。
     """
     path, _, _, proposal = plan(client)
-    assert decide(client, proposal).status_code == 200
+    decision = decide(client, proposal)
+    assert decision.status_code == 200
+    conversation_id = UUID(path.split("/")[2])
     old = claim_job("old-worker")
     with SessionLocal.begin() as session:
         session.get(Job, old.job_id).lease_expires_at = func.clock_timestamp() - timedelta(seconds=1)
@@ -283,10 +371,19 @@ def test_worker_takeover_rolls_back_partial_resolution(client, demo_tickets):
     assert new.job_id == old.job_id and new.token != old.token
     with pytest.raises(LostLease):
         complete_job(old)
+    fail_job(old, RuntimeError("stale worker"))
+    with SessionLocal() as session:
+        before = read_event_head(session, conversation_id)
+        states = [
+            (row.payload["status"], row.payload["attempts"])
+            for row in read_events(session, conversation_id)
+            if row.payload.get("job_id") == decision.json()["resume_job_id"]
+        ]
+        assert states == [("QUEUED", 0), ("RUNNING", 1), ("RUNNING", 2)]
 
     def fail_job_update(_conn, _cursor, statement, _parameters, _context, _executemany):
-        """Fail after business writes have flushed but before the fenced completion.
-        在业务变更写入事务后、租约保护的完成更新前注入错误。
+        """Fail after business writes and events flush but before the fenced completion.
+        在业务变更及事件写入事务后、租约保护的完成更新前注入错误。
         """
         if statement.startswith("UPDATE jobs"):
             raise SQLAlchemyError("simulated completion failure")
@@ -300,6 +397,8 @@ def test_worker_takeover_rolls_back_partial_resolution(client, demo_tickets):
     with SessionLocal() as session:
         assert session.get(Ticket, 391).status == "OPEN"
         assert session.scalars(select(AppliedResolution)).first() is None
+        assert read_event_head(session, conversation_id) == before
+        assert read_events(session, conversation_id, after_seq=before) == []
     assert len(client.get(path).json()) == 1
     complete_job(new)
     with pytest.raises(LostLease):
@@ -307,3 +406,56 @@ def test_worker_takeover_rolls_back_partial_resolution(client, demo_tickets):
     assert len(client.get(path).json()) == 2
     with SessionLocal() as session:
         assert session.scalars(select(AppliedResolution)).one().ticket_id == 391
+        outcome, reply, job = read_events(session, conversation_id, after_seq=before)
+        assert outcome.seq == before + 1 and outcome.event_type == "resolution.completed"
+        assert reply.event_type == "message.created"
+        assert job.payload["status"] == "SUCCEEDED" and job.payload["attempts"] == 2
+
+
+def test_lease_expires_while_waiting_for_event_counter(client, demo_tickets):
+    """Rollback staged work if ownership expires while the worker waits for its event counter.
+    worker 等待事件计数器的期间若租约到期，回滚已暂存的处置。
+    """
+    path, _, _, proposal = plan(client)
+    conversation_id = UUID(path.split("/")[2])
+    assert decide(client, proposal).status_code == 200
+    current = claim_job("short-lease-worker", lease_seconds=3)
+    lease_id = current.job_id
+    attempting_append = Event()
+
+    def note_counter_update(_conn, _cursor, statement, _parameters, _context, _executemany):
+        """Signal that completion has passed its initial lease check and reached the counter.
+        通知测试，完成流程已经通过首次租约校验并到达计数器更新。
+        """
+        if statement.startswith("UPDATE conversation_event_heads"):
+            attempting_append.set()
+
+    event.listen(engine, "before_cursor_execute", note_counter_update)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with SessionLocal.begin() as holder:
+                before = holder.get(
+                    ConversationEventHead, conversation_id, with_for_update=True
+                ).last_event_seq
+                completion = pool.submit(complete_job, current)
+                assert attempting_append.wait(timeout=5)
+                # Leave the counter locked until the database clock crosses the saved expiration.
+                # 保持计数器加锁，直到数据库时钟跨过已保存的租约截止时间。
+                remaining = holder.scalar(
+                    select(func.extract("epoch", Job.lease_expires_at - func.clock_timestamp())).where(
+                        Job.id == lease_id
+                    )
+                )
+                holder.execute(select(func.pg_sleep(max(0, float(remaining)) + 0.05)))
+            with pytest.raises(LostLease):
+                completion.result(timeout=5)
+    finally:
+        event.remove(engine, "before_cursor_execute", note_counter_update)
+
+    with SessionLocal() as session:
+        assert read_event_head(session, conversation_id) == before
+        assert session.get(Job, lease_id).status == "RUNNING"
+        assert session.get(Ticket, 391).status == "OPEN"
+        assert session.scalars(select(AppliedResolution)).first() is None
+    assert len(client.get(path).json()) == 1
+    assert claim_job("replacement-worker").job_id == lease_id

@@ -8,6 +8,8 @@ erDiagram
     conversations ||--o{ messages : contains
     messages ||--o| jobs : creates
     messages o|--o| messages : replies_to
+    conversations ||--|| conversation_event_heads : tracks
+    conversation_event_heads ||--o{ conversation_events : orders
 ```
 
 Every conversation has one account owner. User messages create processing jobs. A human approval can enqueue one continuation for the same user message. Each user message can have at most one final reply.
@@ -21,7 +23,7 @@ Every conversation has one account owner. User messages create processing jobs. 
 - Foreign keys use `ON DELETE RESTRICT`. There are no hard-delete API endpoints.
 - Account ownership is enforced by the API; an existing foreign-key target is not permission to access it.
 
-The following tables describe the current models after migration `0002_english_defaults`. “Required” means `NOT NULL`; “nullable” means SQL `NULL` is allowed.
+The following tables describe the backend through migration `0007_conversation_events`. “Required” means `NOT NULL`. “Nullable” means SQL `NULL` is allowed.
 
 ## Users
 
@@ -111,8 +113,21 @@ The normal path is `QUEUED → RUNNING → SUCCEEDED`. Non-retryable processing 
 
 See [the demo setup](WORKER_BASELINE.md#read-only-refund-check) for sample data and how to run the check.
 
+## Conversation event replay
+
+| Table | Fields and constraints |
+| --- | --- |
+| `conversation_event_heads` | `conversation_id` is the primary key and references `conversations.id`. `last_event_seq` is a nonnegative `BIGINT` and starts at `0`. |
+| `conversation_events` | The primary key is `(conversation_id, seq)`. `conversation_id` references the head row. `seq` is a positive `BIGINT`. Each row holds an `event_type`, a `JSONB` object `payload`, and `created_at` from `clock_timestamp()`. |
+
+The API and worker flush pending business writes before locking the conversation's event head. They allocate and insert an ordered batch in the same transaction. If the transaction fails, the business changes, event rows and cursor advance roll back together. A worker checks its lease again after appending events, so a lease that expires while waiting for the event head cannot publish a result.
+
+The first history page and its event cursor come from one PostgreSQL `REPEATABLE READ` snapshot. Each v2 stream reads committed events after that cursor in sequence order and can resume from any API replica connected to the same database. Event sequences are distinct from message sequences. [Live updates API](LIVE_UPDATES.md#durable-event-replay)
+
 ## Migration and review notes
 
 `0001_initial` contains the historical initial DDL. `0002_english_defaults` changes only the default for future title inserts; existing titles and messages remain unchanged. The English default is also defined in the request schema and ORM model.
 
 `0003_read_only_refund_check` creates orders and executions. `0004_read_only_ticket_lookup` adds tickets, and `0005_resolution_proposals` adds proposals. `0006_approved_resolutions` adds decisions and applied results, and changes job uniqueness to `(source_message_id, kind)`. Downgrading from `0006` requires a database without saved decisions or invalidations. See the [team guide](../README.md) for migration commands and test isolation.
+
+`0007_conversation_events` creates both event tables and initializes existing conversations at `v2:0`. Existing messages, proposals, decisions and refunds remain available through their business tables. The event log begins with writes from the updated API and worker. Stop old API and worker replicas before applying this migration, then start the updated replicas. Downgrading `0007` removes replay history and its counters while retaining the business data. [Deployment procedure](CLOUD_DEPLOYMENT.md#deployment-procedure)

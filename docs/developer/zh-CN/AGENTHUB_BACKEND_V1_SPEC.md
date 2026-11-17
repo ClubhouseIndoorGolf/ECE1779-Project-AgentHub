@@ -373,6 +373,8 @@ ProposalDetail.status 为 PENDING、APPROVED、REJECTED 或 INVALIDATED，来自
 
 ### SSE 与历史快照
 
+当前后端的事件落库、新旧游标兼容和验收顺序见 [审批和执行事件持久化与 SSE 回放计划](AGENTHUB_DURABLE_SSE_REPLAY_PLAN.md)。
+
 事件 envelope：
 
 ~~~json

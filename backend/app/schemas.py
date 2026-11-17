@@ -132,3 +132,17 @@ class JobOut(BaseModel):
 # 推送任务进度时附带任务类型，便于客户端区分普通回复与批准后的恢复执行。
 class JobEventOut(JobOut):
     kind: str
+
+
+class ConversationEventOut(BaseModel):
+    """Describe the committed event as it was recorded at the time of the change.
+    描述状态变化发生时已提交的事件内容。
+    """
+
+    # Use decimal text to preserve BIGINT sequences in JavaScript clients.
+    # 使用十进制字符串，避免 JavaScript 客户端丢失 BIGINT 序号精度。
+    seq: str
+    type: str
+    conversation_id: UUID
+    created_at: datetime
+    payload: dict

@@ -6,6 +6,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.event_store import read_event_head
 from app.models import Execution, Job, Message, ProposalDecision, ResolutionProposal
 from app.resolution_workflow import PROPOSAL_VERSION
 from app.schemas import MessageOut, ProposalOut
@@ -65,6 +66,18 @@ def read_history(session: Session, conversation_id: UUID, after_seq: int, limit:
             result.proposal = proposal_out(execution, proposal, decision, job)
         history.append(result)
     return history
+
+
+def read_history_snapshot(
+    session: Session, conversation_id: UUID, limit: int
+) -> tuple[list[MessageOut], int | None]:
+    """Read the first page and its cursor inside the caller's repeatable-read transaction.
+    在调用方的可重复读事务中读取历史首屏及其游标。
+    """
+    # The cursor must describe the same database snapshot as the page.
+    # 游标必须对应历史首屏使用的同一个数据库快照。
+    messages = read_history(session, conversation_id, 0, limit)
+    return messages, read_event_head(session, conversation_id)
 
 
 def read_proposals(session: Session, conversation_id: UUID) -> list[ProposalOut]:

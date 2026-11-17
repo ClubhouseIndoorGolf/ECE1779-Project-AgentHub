@@ -1,6 +1,6 @@
 # 后端手动测试指南
 
-使用 Swagger 或 Postman 检查账号验证、聊天和持久待办（MT01–MT15）。使用浏览器聊天页检查固定模式下的退款流程（MT16–MT19）。
+使用 Swagger 或 Postman 检查账号验证、聊天和持久待办（MT01–MT15）。使用浏览器聊天页检查固定模式下的退款流程（MT16–MT19），并用 SSE 客户端验证跨副本续传（MT20）。
 
 启动细节见 [中文使用说明](README.md)。[英文版](../../MANUAL_TESTING.md) 使用相同的测试编号和结果字段，方便队员与评审人对照。
 
@@ -199,6 +199,16 @@ docker compose up -d --wait
 
 如需在 Swagger 检查审批重试，从会话历史响应取得已完成卡片的 `proposal.id`。对 `/proposals/{proposal_id}/decision` 两次提交 `{"version":1,"decision":"APPROVE"}`，预期返回相同回执。再对同一方案提交 `REJECT`，预期返回 HTTP `409`。
 
+### MT20 跨 API 副本续传持久化 SSE
+
+按[英文指南的 Compose 配置](../../MANUAL_TESTING.md#mt20-resume-durable-sse-on-another-api-replica)启动独立的固定模式环境，将两个 API 副本分别绑定到不同回环端口，并初始化 `alice`、`bob` 和演示工单。用 Alice 的身份访问两个端口。
+
+仅用浏览器检查时，在两个端口分别以 Alice 登录，并从侧栏打开同一会话。在 A 批准后关闭标签页，在 B 等候同一方案显示为已完成，或从侧栏重新打开会话读取保存的结果。浏览器使用默认 SSE 流。如需继续验证 v2 游标和事件顺序，请在另一个全新的 Compose 项目执行下列步骤，让工单 391 保持可退款状态。
+
+1. 在 API A 的新会话发送 `处理工单 391`，等待 `WAITING_FOR_APPROVAL`。读取历史首屏，保存 `proposal.id` 和 `X-Conversation-Event-Cursor`。用该游标作为 `Last-Event-ID` 打开 A 的 `/conversations/{id}/events?version=2`，收到 `ready` 后断开。
+2. 通过 API B 的 `POST /proposals/{proposal_id}/decision` 提交 `{"version":1,"decision":"APPROVE"}`。用 `resume_job_id` 查询 `GET /jobs/{id}`，等到 `SUCCEEDED`。重复批准应返回相同回执。
+3. 用原游标连接 B 的新版事件流。应依次补回审批、入队、运行、处置完成、助手回复和待办成功共六条事件，游标连续。B 的历史应显示同一方案为 `COMPLETED`。在隔离数据库执行 `SELECT count(*) FROM applied_resolutions WHERE order_id = 1001;`，确认只有一笔模拟退款。
+
 ## 失败时怎样排查
 
 记录测试编号、HTTP 状态、去除敏感信息的响应、相关资源编号和发生时间。查看失败 job 的 `last_error`，并检查日志：
@@ -246,10 +256,11 @@ docker compose logs --tail 100 migrate bootstrap db
 | MT17 | 刷新后恢复待审批方案 | 一张卡片，金额和草稿一致 | 待填写 | NOT_RUN |
 | MT18 | 拒绝方案 | 已拒绝，工单仍打开 | 待填写 | NOT_RUN |
 | MT19 | 批准并重开历史 | 已完成，一笔模拟退款且工单已关闭 | 待填写 | NOT_RUN |
+| MT20 | 跨 API 副本续传 v2 SSE | 六条有序事件和一笔模拟退款 | 待填写 | NOT_RUN |
 
 | 后续信息 | 填写内容 |
 | --- | --- |
-| 汇总 | PASS：__ / FAIL：__ / BLOCKED：__ / NOT_RUN：__；合计 19 项 |
+| 汇总 | PASS：__ / FAIL：__ / BLOCKED：__ / NOT_RUN：__；合计 20 项 |
 | 问题链接与复现步骤 | 待填写 |
 | 复测日期与结果 | 待填写 |
 | 环境恢复确认 | 待填写：确认 worker 运行，检查待办及服务健康状态 |
