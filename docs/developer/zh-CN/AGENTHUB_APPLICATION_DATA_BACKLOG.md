@@ -6,7 +6,7 @@
 
 用户重新打开会话时，可以看到订单能不能退款、方案是批准还是拒绝，以及获批后退款有没有完成。比如，用户只问「这笔订单能退吗」，页面就显示检查结论和原因。如果退款已完成，页面还能显示实际的模拟退款金额。后端负责提供这些数据，前端接入接口后负责展示。
 
-退款检查结果保存在 `executions` 表里。历史接口返回来源消息的 `execution_id`，前端可据此读取结构化的资格、审批和模拟退款结果。 [API 示例](../../../README.md#read-a-saved-refund-result) · [执行记录模型](../../../backend/app/models.py)
+退款检查结果保存在 `executions` 表里。历史接口返回来源消息的 `execution_id`，前端可据此读取结构化的资格、审批和模拟退款结果。 [开发说明](../EXECUTION_DETAILS.md) · [API 示例](../../../README.md#read-a-saved-refund-result) · [执行记录模型](../../../backend/app/models.py)
 
 ### 后端实现
 

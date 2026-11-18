@@ -83,7 +83,7 @@ The [read-only refund check](WORKER_BASELINE.md#read-only-refund-check) evaluate
 
 The [read-only ticket lookup](WORKER_BASELINE.md#read-only-ticket-lookup) resolves a ticket and its linked order for the signed-in account. Fixed mode can [prepare a refund proposal](WORKER_BASELINE.md#prepare-a-refund-proposal) and [apply a simulated resolution after explicit approval](WORKER_BASELINE.md#approve-or-reject-a-refund-proposal). [Live updates](LIVE_UPDATES.md) stream conversation changes over SSE. Cloud orchestration, deployment monitoring and automated backups remain planned. The [original architecture handover](AGENTHUB_TEAM_HANDOVER.md) explains the rationale and alternatives. Its React and cloud diagrams describe proposals. Use current code and team decisions to resolve differences.
 
-For structured refund results, read `execution_id` from the source user message in history and call `GET /executions/{execution_id}` with the same account. A saved check can be `COMPLETED` with an empty `result`. Only a recorded simulated refund supplies an applied amount. [API example](../README.md#read-a-saved-refund-result) · [Manual verification](MANUAL_TESTING.md#mt21-read-saved-execution-details)
+For structured refund results, read `execution_id` from the source user message in history and call `GET /executions/{execution_id}` with the same account. A saved check can be `COMPLETED` with an empty `result`. Only a recorded simulated refund supplies an applied amount. [Developer guide](developer/EXECUTION_DETAILS.md) · [API example](../README.md#read-a-saved-refund-result) · [Manual verification](MANUAL_TESTING.md#mt21-read-saved-execution-details)
 
 For a fresh Codex chat, a useful starting prompt is:
 
