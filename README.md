@@ -135,12 +135,19 @@ Generate a UUID with `[guid]::NewGuid()` in PowerShell or `python -c "import uui
 | `POST /conversations` | Create a conversation owned by the current account |
 | `GET /conversations` | List your conversations, most recently updated first |
 | `POST /conversations/{id}/messages` | Atomically save a message and its job; return stable IDs on retry |
-| `GET /conversations/{id}/messages` | Read messages in sequence order using `after_seq` and `limit` |
+| `GET /conversations/{id}/messages` | Read ordered history with `after_seq`, `limit`, and saved execution IDs on source messages |
 | `GET /jobs/{id}` | Read the processing state of your message's job |
+| `GET /executions/{id}` | Read the saved refund eligibility, approval decision, continuation status, and applied result |
 
 Both list endpoints default to 100 records and accept `limit` from 1 to 500. Requests for another account's resource return `404`; missing or invalid credentials return `401`; invalid input returns `422`; database unavailability returns `503`.
 
 System-generated defaults, validation errors, CLI prompts, logs and API descriptions are English. Source comments are bilingual. User-provided text remains Unicode and is stored as submitted.
+
+### Read a saved refund result
+
+In fixed reply mode with [demo orders seeded](docs/WORKER_BASELINE.md#read-only-refund-check), send `Can order 1002 be refunded?`. After the worker replies, read the conversation history and call `GET /executions/{execution_id}` using the ID on the original user message. In this example, `outcome` is `INELIGIBLE`, `reason_codes` contains `WINDOW_EXPIRED`, and `result` is `null`.
+
+For an approved proposal, `decision` contains the saved approval receipt and `resume_job_status` shows the continuation's job status. Once a simulated refund is recorded, `result.refund_amount_minor` contains the applied amount as a decimal string. Use the presence of `result` to display a completed refund. A finished eligibility check can have `status: "COMPLETED"` with `result: null`.
 
 ## Verify the live system and persistence
 

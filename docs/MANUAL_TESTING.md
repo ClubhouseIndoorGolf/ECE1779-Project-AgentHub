@@ -232,6 +232,14 @@ For a browser check, sign in as Alice in both browsers and open the same saved c
 docker compose -p agenthub-sse-manual -f compose.yaml -f compose.sse-check.yaml exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 ```
 
+### MT21 Read saved execution details
+
+Use a fresh fixed-mode Compose project with the demo accounts and tickets from [the refund workflow setup](#refund-workflow-in-the-browser). Make the API requests with HTTP Basic authentication.
+
+1. As Alice, send `Can order 1002 be refunded?` and wait for the reply. Reopen the conversation and fetch history with `limit=1`. Save the source message's `execution_id` and verify the first page has `X-Conversation-Event-Cursor`. Fetch the next page with `after_seq` set to the source message's `seq`. The assistant reply has no `execution_id`, and the next page has no cursor header.
+2. As Alice, call `GET /executions/{execution_id}`. Expect `200`, `outcome` of `INELIGIBLE`, `reason_codes` containing `WINDOW_EXPIRED`, and `result` of `null`. As Bob, request the same ID and then a random valid UUID. Both return `404` with `{"detail":"Execution not found"}`.
+3. In another conversation, prepare a refund for ticket `391`. The pending execution detail has `status` of `WAITING_FOR_APPROVAL` and `result` of `null`. Approve `proposal.id` and wait for the continuation to succeed. Read the same execution detail again. Expect the saved approval receipt, `status` of `COMPLETED`, `resume_job_status` of `SUCCEEDED`, and `result.refund_amount_minor` of `"12999"` with currency `CAD`.
+
 ## Investigate a failure
 
 Record the case ID, HTTP status, sanitized response, relevant resource IDs and time. Inspect a failed job's `last_error` and the relevant logs:
@@ -280,10 +288,11 @@ Copy this section for each manual test run. Result values are `NOT_RUN`, `PASS`,
 | MT18 | Reject proposal | Rejected; ticket remains open | To fill | NOT_RUN |
 | MT19 | Approve and reopen history | Completed; one simulated refund and resolved ticket | To fill | NOT_RUN |
 | MT20 | Resume v2 SSE on another API replica | Six ordered events and one simulated refund | To fill | NOT_RUN |
+| MT21 | Read saved execution details | Saved eligibility, paginated history cursor, account isolation and applied refund | To fill | NOT_RUN |
 
 | Follow-up detail | Value |
 | --- | --- |
-| Totals | PASS: __ / FAIL: __ / BLOCKED: __ / NOT_RUN: __; total 20 |
+| Totals | PASS: __ / FAIL: __ / BLOCKED: __ / NOT_RUN: __; total 21 |
 | Issue links and reproduction steps | To fill |
 | Retest date and result | To fill |
 | Environment restored | To fill: confirm the worker is running and check pending work and service health |

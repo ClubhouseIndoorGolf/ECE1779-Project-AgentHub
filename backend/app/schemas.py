@@ -7,6 +7,11 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+ExecutionStatus = Literal[
+    "WAITING_FOR_APPROVAL", "QUEUED", "RUNNING", "COMPLETED", "REJECTED", "INVALIDATED", "FAILED"
+]
+JobStatus = Literal["QUEUED", "RUNNING", "SUCCEEDED", "FAILED"]
+
 
 # Reject unknown input fields and provide the English default title.
 # 拒绝未知输入字段，并提供英文默认标题。
@@ -56,9 +61,7 @@ class MessageCreate(BaseModel):
 class ProposalOut(BaseModel):
     id: UUID
     version: Literal[1]
-    status: Literal[
-        "WAITING_FOR_APPROVAL", "QUEUED", "RUNNING", "COMPLETED", "REJECTED", "INVALIDATED", "FAILED"
-    ]
+    status: ExecutionStatus
     # Serialize BIGINT identifiers and amounts as strings so browsers preserve every digit.
     # 将 BIGINT 编号和金额序列化为字符串，避免浏览器丢失精度。
     ticket_id: str
@@ -94,6 +97,37 @@ class ProposalDecisionOut(BaseModel):
     resume_job_id: UUID | None
 
 
+# Expose the persisted business result of an applied simulated refund.
+# 公开已执行模拟退款的持久化业务结果。
+class AppliedResolutionOut(BaseModel):
+    order_id: str
+    ticket_id: str
+    refund_amount_minor: str
+    currency: Literal["CAD"]
+    customer_reply: str
+    applied_at: datetime
+
+
+# Return saved eligibility, workflow state and the result for one user turn.
+# 返回一轮用户请求已保存的资格判断、流程状态和处置结果。
+class ExecutionDetailOut(BaseModel):
+    id: UUID
+    source_message_id: UUID
+    order_id: str
+    outcome: Literal["ELIGIBLE", "INELIGIBLE", "NEEDS_INFORMATION", "NOT_FOUND"]
+    reason_codes: list[str]
+    refund_amount_minor: str | None
+    currency: str | None
+    policy_version: str
+    checked_at: datetime
+    status: ExecutionStatus
+    proposal_id: UUID | None
+    expires_at: datetime | None
+    decision: ProposalDecisionOut | None
+    resume_job_status: JobStatus | None
+    result: AppliedResolutionOut | None
+
+
 # Return saved chat text and its relationship to the originating request.
 # 返回已保存的聊天文本，以及与原始请求的关联。
 class MessageOut(BaseModel):
@@ -105,6 +139,7 @@ class MessageOut(BaseModel):
     seq: int
     reply_to_message_id: UUID | None
     created_at: datetime
+    execution_id: UUID | None = None
     proposal: ProposalOut | None = None
 
 
@@ -121,7 +156,7 @@ class JobOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
     source_message_id: UUID
-    status: Literal["QUEUED", "RUNNING", "SUCCEEDED", "FAILED"]
+    status: JobStatus
     attempts: int
     last_error: str | None
     created_at: datetime
