@@ -147,47 +147,81 @@ probe_before_deadline() {
   timeout --signal=TERM --kill-after=1s "${remaining}s" "$@"
 }
 
-# Wait for the expected replicas to become healthy and the service update to leave the updating state.
-# 等待预期副本达到健康状态，并确认服务已退出更新中状态。
-wait_healthy() {
-  local service=$1 expected=$2 deadline=$((SECONDS + DEPLOY_TIMEOUT)) ids id record node container state count total health update quoted
-  while (( SECONDS < deadline )); do
-    # Check rollout state and list only the tasks Swarm currently wants running.
-    # 检查更新状态，并列出 Swarm 当前期望运行的任务。
-    update=$(probe_before_deadline "$deadline" docker service inspect --format '{{if .UpdateStatus}}{{.UpdateStatus.State}}{{end}}' "$service") || fail "Cannot inspect $service before health-check deadline"
-    case $update in paused|rollback*) fail "Update failed for $service; inspect task history privately" ;; esac
-    ids=$(probe_before_deadline "$deadline" docker service ps --no-trunc -q --filter desired-state=running "$service") || fail "Cannot list $service tasks before health-check deadline"
-    count=0; total=0
-    while IFS= read -r id; do
-      [[ -n $id ]] || continue
-      total=$((total + 1))
-      # Resolve the actual node and container before asking Docker for container health.
-      # 先定位任务实际所在的节点和容器，再向对应节点查询容器健康状态。
-      record=$(probe_before_deadline "$deadline" docker inspect --type task --format '{{.NodeID}}|{{.Status.State}}|{{if .Status.ContainerStatus}}{{.Status.ContainerStatus.ContainerID}}{{end}}' "$id") || fail 'Cannot inspect task before health-check deadline'
-      IFS='|' read -r node state container <<< "$record"
-      [[ $state == running && -n $container ]] || continue
-      # Wrap both local Docker and remote SSH calls with the same deadline.
-      # 本地 Docker 查询和远端 SSH 查询共用同一截止时间。
-      if [[ $node == "$MANAGER_ID" ]]; then
-        health=$(probe_before_deadline "$deadline" docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container" 2>/dev/null) || health=unavailable
-      else
-        [[ $node == "$WORKER_ID" && -n ${WORKER_SSH:-} ]] || fail 'Unknown remote node'
-        printf -v quoted '%q ' docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container"
-        health=$(probe_before_deadline "$deadline" ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 "$WORKER_SSH" "$quoted" 2>/dev/null) || health=unavailable
-      fi
-      (( SECONDS < deadline )) || fail "Health/convergence timeout for $service; no automatic retry or rollback performed"
-      [[ $health != healthy ]] || count=$((count + 1))
-    done <<< "$ids"
-    # Count only healthy tasks that Swarm still wants running.
-    # 仅统计 Swarm 期望继续运行且健康的任务。
-    if (( count == expected && total == expected )) && [[ $update != updating ]]; then
-      (( SECONDS < deadline )) || fail "Health/convergence timeout for $service; no automatic retry or rollback performed"
-      note "$service: $count healthy tasks"
-      return
+# Give each read at most ten seconds of the service wait, including remote inspection.
+# 每次只读查询最多使用服务等待预算中的十秒，远端检查也受此限制。
+health_probe() {
+  local deadline=$1 limit=$((SECONDS + 10))
+  shift
+  probe_before_deadline "$((deadline < limit ? deadline : limit))" "$@" </dev/null 2>/dev/null
+}
+
+# Check one fresh snapshot. On retry, detail tells wait_healthy what was missing.
+# 每轮重新检查。需要重试时，通过 detail 告知 wait_healthy 尚未满足的条件。
+service_healthy() {
+  local service=$1 expected=$2 deadline=$3 required_node=$4
+  local update ids id record node state container health quoted
+  local -a tasks=() inspect
+  local -A seen=()
+
+  detail='service inspection unavailable'
+  update=$(health_probe "$deadline" docker service inspect --format '{{if .UpdateStatus}}{{.UpdateStatus.State}}{{end}}' "$service") || return 1
+  case $update in
+    ''|completed) ;;
+    failed|paused|rollback*) fail "Update failed for $service ($update); inspect task history privately" ;;
+    *) detail="update state is $update"; return 1 ;;
+  esac
+
+  detail='desired task list unavailable'
+  ids=$(health_probe "$deadline" docker service ps --no-trunc -q --filter desired-state=running "$service") || return 1
+  [[ -z $ids ]] || mapfile -t tasks <<< "$ids"
+  detail="${#tasks[@]} desired tasks, expected $expected"
+  (( ${#tasks[@]} == expected )) || return 1
+  for id in "${tasks[@]}"; do
+    detail='empty or duplicate task ID'
+    [[ -n $id && -z ${seen[$id]:-} ]] || return 1
+    seen[$id]=1
+    detail="inspection unavailable for task $id"
+    record=$(health_probe "$deadline" docker inspect --type task --format '{{.NodeID}}|{{.Status.State}}|{{if .Status.ContainerStatus}}{{.Status.ContainerStatus.ContainerID}}{{end}}' "$id") || return 1
+    IFS='|' read -r node state container <<< "$record"
+    detail="task $id is ${state:-unknown} without a running container"
+    [[ $state == running && -n $container ]] || return 1
+    [[ -z $required_node || $node == "$required_node" ]] || fail "Task $id is on the wrong node for $service"
+
+    # Inspect the container through the Docker daemon on its assigned node.
+    # 通过任务所在节点的 Docker daemon 检查容器。
+    inspect=(docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container")
+    if [[ $node != "$MANAGER_ID" ]]; then
+      [[ -n $node && $node == "$WORKER_ID" && -n ${WORKER_SSH:-} ]] || fail 'Unknown remote node'
+      printf -v quoted '%q ' "${inspect[@]}"
+      inspect=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 "$WORKER_SSH" "$quoted")
     fi
-    sleep 2
+    detail="container inspection unavailable for task $id on $node"
+    health=$(health_probe "$deadline" "${inspect[@]}") || return 1
+    detail="task $id on $node reports container state|health ${health:-unknown}"
+    [[ $health == 'running|healthy' ]] || return 1
   done
-  fail "Health/convergence timeout for $service; no automatic retry or rollback performed"
+}
+
+# Retry read-only observations within one deadline; never reuse a partial count.
+# 在同一截止时间内重试只读检查，每轮独立核对全部副本。
+wait_healthy() {
+  local service=$1 expected=$2 deadline=$((SECONDS + DEPLOY_TIMEOUT)) remaining
+  local detail='no observation completed' previous_detail=''
+  while (( SECONDS < deadline )); do
+    if service_healthy "$service" "$expected" "$deadline" "${3:-}"; then
+      (( SECONDS < deadline )) || { detail='healthy observations arrived too late'; break; }
+      note "$service: $expected healthy tasks"
+      return 0
+    fi
+    remaining=$((deadline - SECONDS))
+    (( remaining > 0 )) || break
+    if [[ $detail != "$previous_detail" ]]; then
+      printf 'Waiting for %s: %s\n' "$service" "$detail" >&2
+      previous_detail=$detail
+    fi
+    sleep "$((remaining < 2 ? remaining : 2))"
+  done
+  fail "Health/convergence timeout for $service: $detail"
 }
 
 # Verify the manager, node placement, storage, and images required for deployment.

@@ -43,7 +43,7 @@ wait_stopped "${STACK}_worker"
 wait_stopped "${STACK}_setup"
 # Begin setup only after PostgreSQL is healthy and the old tasks are stopped.
 # 等待旧任务停止且 PostgreSQL 健康后，再开始 setup。
-wait_healthy "${STACK}_db" 1
+wait_healthy "${STACK}_db" 1 "$DB_NODE"
 
 stage=migration-and-bootstrap
 # Require a dormant setup service with retries disabled before launching one task.
