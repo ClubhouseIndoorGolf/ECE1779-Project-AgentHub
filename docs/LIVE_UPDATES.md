@@ -16,7 +16,7 @@ The browser receives conversation changes over a Server-Sent Events (SSE) stream
 | Event | `id` | `data` |
 | :-- | :-- | :-- |
 | `ready` | Current cursor | `{"cursor": <seq>}`. Sent once per connection. |
-| `message` | Message `seq` | The same object as one row of `GET /conversations/{id}/messages`, including any `proposal`. |
+| `message` | Message `seq` | The same object as one row of `GET /conversations/{id}/messages`, including any saved `execution_id` and `proposal`. |
 | `job` | None | Public job fields (`id`, `source_message_id`, `kind`, `status`, `attempts`, `last_error`, `created_at`, `finished_at`). Sent when a job's status or attempt count changes. Lease fields are never included. |
 | `proposal` | None | The public proposal object. Sent when a proposal appears or its status or decision changes. |
 | `error` | None | `{"detail": "Database temporarily unavailable"}`. The stream then closes, and the client reconnects with backoff. |
@@ -27,7 +27,7 @@ Each connection tracks the state it has already sent, so it sends a job or propo
 
 1. Read the first page of `GET /conversations/{id}/messages` with `after_seq=0` or omit that parameter. The body remains a message list. The `X-Conversation-Event-Cursor` response header captures the conversation's event head from the same database snapshot as that page. Use the last message's `seq` as `after_seq` to load subsequent pages. Each page is a separate read, and the v2 cursor is returned only with the first page.
 2. Open `GET /conversations/{id}/events?version=2` with that header value as `Last-Event-ID`. On reconnect, send the ID of the last complete event frame. The server replays later events from PostgreSQL in sequence order. An explicit `v2:0` starts at the first recorded event.
-3. Retain the cursor per conversation. Deduplicate replayed frames by conversation ID and event sequence. Each event describes a committed transition and carries references to the affected records. Read history or job status to retrieve the current state and full message or proposal details.
+3. Retain the cursor per conversation. Deduplicate replayed frames by conversation ID and event sequence. Each event describes a committed transition and carries references to the affected records. Read history to retrieve full messages and proposal details, and `GET /jobs/{id}` for job state. Use the source message's saved `execution_id` with `GET /executions/{execution_id}` to retrieve eligibility and the applied refund. [Execution details example](../README.md#read-a-saved-refund-result)
 
 The version 2 endpoint returns `422` before streaming if the cursor is missing, malformed, a legacy numeric cursor, or ahead of the conversation's committed event head. Reload the history snapshot to obtain a valid cursor. Both versions check the same account ownership and use short database sessions.
 

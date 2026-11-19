@@ -45,7 +45,7 @@ AgentHub is a University of Toronto ECE1779 team project for small-business supp
 | Component | Source and responsibility |
 | --- | --- |
 | Browser workspace | [Static assets](../backend/app/static/) served by FastAPI. The client renders chat, signs in, retrieves history and follows job progress over the [SSE stream](LIVE_UPDATES.md), polling as a fallback. |
-| API | [main.py](../backend/app/main.py) and [schemas.py](../backend/app/schemas.py). Authenticate and scope access, accept messages, expose saved conversations and job status. |
+| API | [main.py](../backend/app/main.py) and [schemas.py](../backend/app/schemas.py). Authenticate and scope access, accept messages, and expose saved conversations, job status and refund execution details. |
 | PostgreSQL | [models.py](../backend/app/models.py) and [Alembic revisions](../backend/migrations/versions/). Store users, conversations, messages, jobs, demo orders and eligibility results. |
 | Independent worker | [worker.py](../backend/app/worker.py). Claim jobs, renew leases, retry transient failures and commit replies. |
 | Reply providers | [replies.py](../backend/app/replies.py). Fixed acknowledgements or optional OpenAI text generation. |
@@ -82,6 +82,8 @@ The proposed course demo is a single support and refund triage workflow with syn
 The [read-only refund check](WORKER_BASELINE.md#read-only-refund-check) evaluates one simulated order and persists the conclusion alongside the chat reply. Ticket lookup and approved resolutions follow the order check.
 
 The [read-only ticket lookup](WORKER_BASELINE.md#read-only-ticket-lookup) resolves a ticket and its linked order for the signed-in account. Fixed mode can [prepare a refund proposal](WORKER_BASELINE.md#prepare-a-refund-proposal) and [apply a simulated resolution after explicit approval](WORKER_BASELINE.md#approve-or-reject-a-refund-proposal). [Live updates](LIVE_UPDATES.md) stream conversation changes over SSE. Cloud orchestration, deployment monitoring and automated backups remain planned. The [original architecture handover](AGENTHUB_TEAM_HANDOVER.md) explains the rationale and alternatives. Its React and cloud diagrams describe proposals. Use current code and team decisions to resolve differences.
+
+For structured refund results, read `execution_id` from the source user message in history and call `GET /executions/{execution_id}` with the same account. A saved check can be `COMPLETED` with an empty `result`. Only a recorded simulated refund supplies an applied amount. [Developer guide](developer/EXECUTION_DETAILS.md) · [API example](../README.md#read-a-saved-refund-result) · [Manual verification](MANUAL_TESTING.md#mt21-read-saved-execution-details)
 
 For a fresh Codex chat, a useful starting prompt is:
 

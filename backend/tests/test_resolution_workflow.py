@@ -3,7 +3,7 @@
 """
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event
 from uuid import UUID, uuid4
@@ -84,11 +84,22 @@ def expire_proposal(proposal):
         )
 
 
+def execution_path(client, history_path):
+    return f"/executions/{client.get(history_path).json()[0]['execution_id']}"
+
+
 def test_approved_resolution_preserves_receipts_and_applies_exact_draft(client, demo_tickets):
     """Keep both retry receipts stable and persist exactly the approved business action.
     保持两种重试回执稳定，并按获批内容精确保存业务动作。
     """
     path, payload, initial, proposal = plan(client)
+    detail_path = execution_path(client, path)
+    pending = client.get(detail_path).json()
+    assert pending["source_message_id"] == initial["message_id"]
+    assert pending["proposal_id"] == proposal["id"]
+    assert pending["expires_at"] == proposal["expires_at"]
+    assert pending["status"] == "WAITING_FOR_APPROVAL"
+    assert pending["decision"] is pending["resume_job_status"] is pending["result"] is None
     assert decide(client, proposal, auth=("bob", "bob-test-password")).status_code == 404
     assert decide(client, {**proposal, "version": 2}).status_code == 409
     blocked = client.post(path, json={"content": "Approve it", "submission_key": str(uuid4())})
@@ -102,9 +113,16 @@ def test_approved_resolution_preserves_receipts_and_applies_exact_draft(client, 
     assert decision["resume_job_id"] != initial["job_id"]
     assert client.post(path, json=payload).json() == initial
     assert client.get(path).json()[0]["proposal"]["status"] == "QUEUED"
+    queued = client.get(detail_path).json()
+    assert queued["status"] == queued["resume_job_status"] == "QUEUED"
+    assert queued["decision"] == decision
+    assert queued["result"] is None
     claim = claim_job("apply-worker")
     assert claim.kind == "RESUME_EXECUTION"
     assert client.get(path).json()[0]["proposal"]["status"] == "RUNNING"
+    running = client.get(detail_path).json()
+    assert running["status"] == running["resume_job_status"] == "RUNNING"
+    assert running["result"] is None
     complete_job(claim)
 
     messages = client.get(path).json()
@@ -114,10 +132,24 @@ def test_approved_resolution_preserves_receipts_and_applies_exact_draft(client, 
     assert "CAD 129.99" in messages[1]["content"]
     assert decide(client, proposal).json() == decision
     assert decide(client, proposal, "REJECT").status_code == 409
+    detail = client.get(detail_path).json()
+    assert detail["status"] == "COMPLETED"
+    assert detail["resume_job_status"] == "SUCCEEDED"
+    assert detail["decision"] == decision
+    result = detail["result"]
+    applied_at = datetime.fromisoformat(result.pop("applied_at"))
+    assert result == {
+        "order_id": "1001",
+        "ticket_id": "391",
+        "refund_amount_minor": "12999",
+        "currency": "CAD",
+        "customer_reply": proposal["customer_reply"],
+    }
     with SessionLocal() as session:
         action = session.scalars(select(AppliedResolution)).one()
         assert (action.order_id, action.ticket_id, action.refund_amount_minor) == (1001, 391, 12999)
         assert action.customer_reply == proposal["customer_reply"]
+        assert action.applied_at == applied_at
         assert session.get(Ticket, 391).status == "RESOLVED"
         # A successful refund publishes its decision and final results once, in causal order.
         # 成功退款按因果顺序记录一次审批决定和最终结果。
@@ -162,12 +194,59 @@ def test_rejection_leaves_business_data_unchanged(client, demo_tickets):
     assert response.json()["resume_job_id"] is None
     assert decide(client, proposal, "REJECT").json() == response.json()
     assert client.get(path).json()[0]["proposal"]["status"] == "REJECTED"
+    detail = client.get(execution_path(client, path)).json()
+    assert detail["status"] == "REJECTED"
+    assert detail["decision"] == response.json()
+    assert detail["resume_job_status"] is detail["result"] is None
     with SessionLocal() as session:
         assert session.get(Ticket, 391).status == "OPEN"
         assert session.get(Order, 1001).paid_total_minor == 12999
         assert session.scalars(select(AppliedResolution)).first() is None
         assert session.scalars(select(Job).where(Job.kind == "RESUME_EXECUTION")).first() is None
     assert client.post(path, json={"content": "Hello", "submission_key": str(uuid4())}).status_code == 202
+
+
+def test_execution_detail_retains_approval_when_continuation_fails(client, demo_tickets):
+    path, _, _, proposal = plan(client)
+    response = decide(client, proposal)
+    assert response.status_code == 200
+    claim = claim_job("failing-worker")
+    assert str(claim.job_id) == response.json()["resume_job_id"]
+    fail_job(claim, RuntimeError("Failure before committing the resolution"))
+
+    detail = client.get(execution_path(client, path)).json()
+    assert detail["status"] == detail["resume_job_status"] == "FAILED"
+    assert detail["decision"] == response.json()
+    assert detail["result"] is None
+    assert "last_error" not in detail
+
+
+def test_execution_detail_serializes_bigint_numbers_and_amounts_as_strings(client, accounts):
+    order_id = 2**63 - 1
+    ticket_id = order_id - 1
+    amount = order_id - 2
+    with SessionLocal.begin() as session:
+        session.add(
+            Order(
+                id=order_id,
+                assigned_user_id=accounts[0],
+                payment_status="PAID",
+                fulfillment_status="DELIVERED",
+                paid_total_minor=amount,
+                currency="CAD",
+                delivered_at=func.clock_timestamp() - timedelta(days=1),
+            )
+        )
+        session.flush()
+        session.add(Ticket(id=ticket_id, order_id=order_id, assigned_user_id=accounts[0]))
+
+    path, _, _, proposal = plan(client, ticket_id=ticket_id)
+    assert decide(client, proposal).status_code == 200
+    assert run_once("apply-worker")
+    detail = client.get(execution_path(client, path)).json()
+    assert detail["order_id"] == detail["result"]["order_id"] == str(order_id)
+    assert detail["result"]["ticket_id"] == str(ticket_id)
+    assert detail["refund_amount_minor"] == detail["result"]["refund_amount_minor"] == str(amount)
 
 
 @pytest.mark.parametrize("second_decision", ["APPROVE", "REJECT"])
@@ -240,12 +319,15 @@ def test_expired_or_changed_proposal_never_writes_business_data(client, demo_tic
     使过时方案失效，并保留此前已存在的批准回执。
     """
     path, _, _, proposal = plan(client)
+    decision = resume_job_status = None
     if change == "expired_before_approval":
         expire_proposal(proposal)
         assert decide(client, proposal).status_code == 409
     else:
         response = decide(client, proposal)
         assert response.status_code == 200
+        decision = response.json()
+        resume_job_status = "SUCCEEDED"
         if change == "expired_after_approval":
             expire_proposal(proposal)
         else:
@@ -255,6 +337,11 @@ def test_expired_or_changed_proposal_never_writes_business_data(client, demo_tic
         assert decide(client, proposal).json() == response.json()
     source = client.get(path).json()[0]
     assert source["proposal"]["status"] == "INVALIDATED"
+    detail = client.get(f"/executions/{source['execution_id']}").json()
+    assert detail["status"] == "INVALIDATED"
+    assert detail["decision"] == decision
+    assert detail["resume_job_status"] == resume_job_status
+    assert detail["result"] is None
     with SessionLocal() as session:
         assert session.get(Ticket, 391).status == "OPEN"
         assert session.scalars(select(AppliedResolution)).first() is None
@@ -349,6 +436,14 @@ def test_parallel_proposals_can_refund_order_only_once(client, demo_tickets):
         list(pool.map(complete_job, claims))
     states = [client.get(path).json()[0]["proposal"]["status"] for path, *_ in paths_and_proposals]
     assert sorted(states) == ["COMPLETED", "INVALIDATED"]
+    for (path, _, _, proposal), state in zip(paths_and_proposals, states, strict=True):
+        detail = client.get(execution_path(client, path)).json()
+        assert detail["status"] == state
+        assert detail["decision"]["proposal_id"] == proposal["id"]
+        if state == "COMPLETED":
+            assert detail["result"]["ticket_id"] == proposal["ticket_id"]
+        else:
+            assert detail["result"] is None
     with SessionLocal() as session:
         action = session.scalars(select(AppliedResolution)).one()
         assert session.get(Ticket, action.ticket_id).status == "RESOLVED"

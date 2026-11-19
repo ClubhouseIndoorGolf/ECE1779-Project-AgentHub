@@ -72,6 +72,7 @@ def test_fixed_reply_pipeline_and_pagination(client):
     assert not run_once("test-worker")
     messages = client.get(f"/conversations/{conversation}/messages").json()
     assert [m["seq"] for m in messages] == [1, 2]
+    assert all("execution_id" not in message for message in messages)
     assert messages[1]["reply_to_message_id"] == receipt["message_id"]
     assert messages[1]["content"] == "Message received."
     assert client.get(f"/jobs/{receipt['job_id']}").json()["status"] == "SUCCEEDED"
@@ -125,15 +126,49 @@ def test_refund_check_via_message(client, content, order_id, outcome, reasons, a
     messages = client.get(messages_url).json()
     assert [message["content"] for message in messages] == [content, reply]
     assert messages[1]["reply_to_message_id"] == receipt["message_id"]
+    assert "proposal" not in messages[0]
+    assert "execution_id" not in messages[1]
+    execution_id = messages[0]["execution_id"]
+    response = client.get(f"/executions/{execution_id}")
+    assert response.status_code == 200, response.text
+    detail = response.json()
+    checked_at = datetime.fromisoformat(detail.pop("checked_at"))
+    assert detail == {
+        "id": execution_id,
+        "source_message_id": receipt["message_id"],
+        "order_id": str(order_id),
+        "outcome": outcome,
+        "reason_codes": reasons,
+        "refund_amount_minor": str(amount) if amount is not None else None,
+        "currency": None if outcome == "NOT_FOUND" else "CAD",
+        "policy_version": "DEMO-CAD-30D/v1",
+        "status": "COMPLETED",
+        "proposal_id": None,
+        "expires_at": None,
+        "decision": None,
+        "resume_job_status": None,
+        "result": None,
+    }
     with SessionLocal() as session:
         execution = session.scalars(select(Execution)).one()
-        assert str(execution.source_message_id) == receipt["message_id"]
-        assert execution.requested_order_id == order_id
-        assert execution.outcome == outcome
-        assert execution.reason_codes == reasons
-        assert execution.refund_amount_minor == amount
-        assert execution.currency == (None if outcome == "NOT_FOUND" else "CAD")
-        assert execution.policy_version == "DEMO-CAD-30D/v1"
+        assert str(execution.id) == execution_id
+        assert execution.checked_at == checked_at
+
+
+def test_execution_detail_requires_conversation_owner(client):
+    seed_demo_orders("alice", "bob")
+    conversation, _, _ = submit(client, content="Can order 1001 be refunded?")
+    assert run_once("refund-worker")
+    history = client.get(f"/conversations/{conversation}/messages").json()
+    url = f"/executions/{history[0]['execution_id']}"
+    assert client.get(url).status_code == 200
+    assert client.get(url, auth=None).status_code == 401
+
+    bob = ("bob", "bob-test-password")
+    forbidden = client.get(url, auth=bob)
+    missing = client.get(f"/executions/{uuid4()}", auth=bob)
+    assert forbidden.status_code == missing.status_code == 404
+    assert forbidden.json() == missing.json() == {"detail": "Execution not found"}
 
 
 @pytest.mark.parametrize(

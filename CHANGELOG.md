@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### 2026-11-18
+
+- **Saved refund execution details.** History exposes `execution_id` on the source message of a saved refund check. `GET /executions/{execution_id}` returns the saved eligibility, approval receipt, continuation status, and applied refund for the owning account. Order numbers and amounts in minor units are decimal strings. The history pagination and SSE v2 cursor contracts remain compatible with existing clients. [API example](README.md#read-a-saved-refund-result) · [Verification procedure](docs/MANUAL_TESTING.md#mt21-read-saved-execution-details)
+- **Local verification.** Passed 126 backend tests on isolated PostgreSQL, 20 offline client tests, and Ruff lint and format checks. The fixed-mode Compose smoke test and MT21 API checks passed against the running API and worker.
+
 ### 2026-11-16
 
 - **Durable conversation events and v2 replay.** Migration `0007_conversation_events` adds a per-conversation event log. The API and worker commit message, proposal, decision, job and resolution events with the corresponding business changes. The first history page supplies `X-Conversation-Event-Cursor` so clients can resume `/events?version=2` on any replica using the same PostgreSQL database. The browser continues using the default SSE stream with numeric message cursors. [Live updates API](docs/LIVE_UPDATES.md#durable-event-replay)

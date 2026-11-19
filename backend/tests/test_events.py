@@ -199,7 +199,10 @@ def test_durable_history_cursor_is_only_on_the_first_page(client):
     empty_page = client.get(url)
     assert empty_page.status_code == 200 and empty_page.json() == []
     assert empty_page.headers["X-Conversation-Event-Cursor"] == "v2:0"
-    assert client.post(url, json={"content": "Hello", "submission_key": str(uuid4())}).status_code == 202
+    payload = {"content": "Can order 9000 be refunded?", "submission_key": str(uuid4())}
+    submitted = client.post(url, json=payload)
+    assert submitted.status_code == 202
+    assert "execution_id" not in client.get(url).json()[0]
     assert run_once("snapshot-worker")
 
     # The event head covers the snapshot, even when more messages need to be paged in.
@@ -210,6 +213,20 @@ def test_durable_history_cursor_is_only_on_the_first_page(client):
     more = client.get(url, params={"after_seq": 1, "limit": 1})
     assert "X-Conversation-Event-Cursor" not in more.headers
     assert [row["seq"] for row in more.json()] == [2]
+    assert "execution_id" not in more.json()[0]
+    execution_id = first.json()[0]["execution_id"]
+    detail = client.get(f"/executions/{execution_id}").json()
+    assert detail["source_message_id"] == submitted.json()["message_id"]
+
+    # Exercise a source message that appears on a later page too.
+    # 验证出现在后续页的来源消息也带有执行记录编号。
+    payload["submission_key"] = str(uuid4())
+    assert client.post(url, json=payload).status_code == 202
+    assert run_once("snapshot-worker")
+    later = client.get(url, params={"after_seq": 2, "limit": 1})
+    assert "X-Conversation-Event-Cursor" not in later.headers
+    assert later.json()[0]["seq"] == 3
+    assert later.json()[0]["execution_id"] != execution_id
 
 
 @pytest.mark.parametrize(
