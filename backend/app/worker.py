@@ -5,21 +5,23 @@ import logging
 import signal
 import socket
 import time
+from collections.abc import Sequence
 from contextlib import contextmanager
 from datetime import timedelta
 from threading import Event, Thread
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import Session, aliased
 
 from app.agent import actor, check_deadline, run_agent
 from app.agent_contract import TERMINAL, Decision
 from app.config import positive_number
 from app.db import SessionLocal
+from app.event_store import EventToAppend, append_events, job_status_event, message_created_event
 from app.leases import Claim, LostLease, owned_job
-from app.models import AgentStep, Conversation, Job, Message
+from app.models import AgentStep, Conversation, Job, Message, ResolutionProposal
 from app.replies import FixedReply, ReplySettings, RetryableReplyError, build_reply_provider
 from app.resolution_workflow import (
     append_final_reply,
@@ -51,15 +53,15 @@ def clear_lease(job):
 # Skip rows locked by other workers and reclaim expired attempts safely.
 # 跳过其他 worker 已锁定的记录，并安全接管过期工作。
 def claim_job(owner: str, lease_seconds=60, max_attempts=3) -> Claim | None:
-    """Atomically claim ready work without overtaking an unfinished conversation turn.
-    原子领取已就绪的任务，且不越过同一会话中尚未完成的较早消息。
+    """Publish a claim or exhaustion in turn order while holding the job row lock.
+    持有待办行锁时，按会话顺序记录领取或尝试次数耗尽。
     """
     with SessionLocal.begin() as session:
         # Use database time and skip locked jobs so replicas do not share one claim.
         # 使用数据库时间并跳过已锁定任务，避免多个副本领取同一项工作。
         now = session.scalar(select(func.clock_timestamp()))
-        job = session.scalar(
-            select(Job)
+        row = session.execute(
+            select(Job, Message.conversation_id)
             .join(Message, Job.source_message_id == Message.id)
             .where(
                 # Keep retries and approvals ahead of every later turn in the same conversation.
@@ -73,18 +75,27 @@ def claim_job(owner: str, lease_seconds=60, max_attempts=3) -> Claim | None:
             .order_by(Job.available_at, Job.created_at)
             .with_for_update(skip_locked=True, of=Job)
             .limit(1)
-        )
-        if not job:
+        ).one_or_none()
+        if row is None:
             return None
+        job, conversation_id = row
         if job.attempts >= max_attempts:
             # Exhausted interrupted work must become terminal to unblock its successors.
             # 中断后已耗尽领取次数的任务必须进入终态，后续消息才能继续处理。
+            append_events(session, conversation_id, [job_status_event(job, status="FAILED")])
+            now = session.scalar(select(func.clock_timestamp()))
             job.status = "FAILED"
             job.finished_at = now
             job.updated_at = now
             job.last_error = "Worker claim limit reached after interruption"
             clear_lease(job)
             return None
+
+        # Wait for the event counter before starting the new lease clock.
+        # 等待事件计数器锁后再开始计算新租约的有效期。
+        progress = job_status_event(job, status="RUNNING", attempts=job.attempts + 1)
+        append_events(session, conversation_id, [progress])
+        now = session.scalar(select(func.clock_timestamp()))
         # Each attempt gets a fresh token; every later write must prove this ownership.
         # 每次尝试使用新令牌；后续每一次写入都必须证明仍持有此次领取权。
         job.status = "RUNNING"
@@ -189,27 +200,93 @@ def load_context(claim: Claim, settings: ReplySettings):
         return list(reversed(context))
 
 
+def lock_owned_job(session: Session, claim: Claim) -> tuple[Job, UUID]:
+    """Lock the owned job and return its conversation without locking the message.
+    锁定当前领取的待办并返回其会话编号，消息行保持无锁读取。
+    """
+    row = session.execute(
+        select(Job, Message.conversation_id)
+        .join(Message, Message.id == Job.source_message_id)
+        .where(owned_job(claim))
+        .with_for_update(of=Job)
+    ).one_or_none()
+    if row is None:
+        raise LostLease()
+    job, conversation_id = row
+    return job, conversation_id
+
+
+def transition_owned_job(
+    session: Session,
+    claim: Claim,
+    job: Job,
+    conversation_id: UUID,
+    *,
+    status: str,
+    last_error: str | None = None,
+    retry_delay: timedelta | None = None,
+    preceding_events: Sequence[EventToAppend] = (),
+    agent_deadline: bool = False,
+) -> None:
+    """Append the transition and recheck ownership before updating the already locked job.
+    追加状态变更事件，在更新已加锁的待办前再次校验领取权。
+    """
+    # The store flushes pending business writes before locking the event counter.
+    # The final guarded UPDATE touches the job row already locked by the caller.
+    # 存储模块在取得事件计数器锁前写入待保存的业务变更。
+    # 最后一次带租约校验的 UPDATE 仅更新调用方已加锁的待办行。
+    append_events(session, conversation_id, [*preceding_events, job_status_event(job, status=status)])
+    if agent_deadline:
+        check_deadline(session, job)
+    now = func.clock_timestamp()
+    availability = {"finished_at": now} if retry_delay is None else {"available_at": now + retry_delay}
+    changed = session.execute(
+        update(Job)
+        .where(owned_job(claim))
+        .values(
+            status=status,
+            lease_owner=None,
+            lease_token=None,
+            lease_expires_at=None,
+            updated_at=now,
+            last_error=last_error,
+            **availability,
+        )
+        .execution_options(synchronize_session=False)
+    ).rowcount
+    if changed != 1:
+        # A lease can expire while waiting for the counter. Roll back the entire batch and business writes.
+        # 等待计数器时租约可能到期，此时回滚整个事件批次和业务变更。
+        raise LostLease()
+
+
 def retry_job(claim: Claim, *, max_attempts, failure="Model temporarily unavailable"):
-    """Persist a bounded retry delay, or mark the final attempt as failed.
-    将有次数上限的重试延迟写入数据库；最后一次尝试失败时直接进入失败终态。
+    """Publish a bounded retry or mark the final attempt as failed.
+    记录有次数上限的重试，或将最后一次尝试标记为失败。
     """
     with SessionLocal.begin() as session:
-        job = session.scalar(select(Job).where(owned_job(claim)).with_for_update())
-        if not job:
-            raise LostLease()
-        now = session.scalar(select(func.clock_timestamp()))
-        job.updated_at = now
+        job, conversation_id = lock_owned_job(session, claim)
         if job.attempts >= max_attempts:
-            job.status = "FAILED"
-            job.finished_at = now
-            job.last_error = failure + "; retry limit reached"
+            transition_owned_job(
+                session,
+                claim,
+                job,
+                conversation_id,
+                status="FAILED",
+                last_error=failure + "; retry limit reached",
+            )
         else:
             # attempts includes the first claim; delay grows exponentially up to 30 s.
             # attempts 包含首次领取；重试延迟按指数增长，但最多等待 30 秒。
-            job.status = "QUEUED"
-            job.available_at = now + timedelta(seconds=min(2**job.attempts, 30))
-            job.last_error = failure + "; retry scheduled"
-        clear_lease(job)
+            transition_owned_job(
+                session,
+                claim,
+                job,
+                conversation_id,
+                status="QUEUED",
+                last_error=failure + "; retry scheduled",
+                retry_delay=timedelta(seconds=min(2**job.attempts, 30)),
+            )
 
 
 # Commit the result and completion together, rechecking ownership before success.
@@ -221,8 +298,8 @@ def complete_job(
     check_refund_requests: bool = False,
     agent_step: int | None = None,
 ):
-    """Commit a reply, proposal, or approved action together with the fenced job result.
-    在同一次有效领取下提交回复、方案或获批动作，以及待办结果。
+    """Commit the result and its events under a final check of the worker's lease.
+    在最后一次租约校验的保护下提交业务结果及对应事件。
     """
     # Lock the current job and load the source of the reply before staging writes.
     # 在准备写入前锁定当前待办，并读取回复对应的来源消息。
@@ -238,8 +315,8 @@ def complete_job(
         conversation = session.scalar(
             select(Conversation).where(Conversation.id == source.conversation_id).with_for_update()
         )
-        # Complete terminal agent steps in the same transaction as their reply or proposal.
-        # 终结 Agent 步骤与对应回复或方案在同一事务中完成。
+        # Terminal decisions, business results and durable events share the final lease fence.
+        # 终结决策、业务结果和持久事件共用最后的租约校验。
         step = None
         if agent_step is not None:
             check_deadline(session, job)
@@ -253,81 +330,84 @@ def complete_job(
             ):
                 raise ValueError("Invalid terminal agent step")
             decision = Decision(step.name, step.arguments).validated()
-            if decision.name == "prepare_refund":
-                final_reply = prepare_refund(
+            outcome = (
+                prepare_refund(
                     session, source.id, conversation.user_id, PrepareRefund.model_validate(decision.arguments)
                 )
-            else:
-                final_reply = decision.arguments["text"]
-            step.result = {"outcome": "WAITING_FOR_APPROVAL" if final_reply is None else "REPLIED"}
+                if decision.name == "prepare_refund"
+                else decision.arguments["text"]
+            )
+            step.result = {
+                "outcome": "WAITING_FOR_APPROVAL" if isinstance(outcome, ResolutionProposal) else "REPLIED"
+            }
             step.finished_at = func.clock_timestamp()
         elif job.kind == "RESUME_EXECUTION":
-            apply_approved_resolution(session, job, conversation)
+            events = apply_approved_resolution(session, job, conversation)
         else:
             if reply is None or not reply.strip():
                 raise ValueError("Reply must not be blank")
-            final_reply = reply
+            outcome = reply
             if check_refund_requests:
                 action = parse_prepare_refund(source.content)
                 if action is not None:
-                    final_reply = prepare_refund(session, source.id, conversation.user_id, action)
+                    outcome = prepare_refund(session, source.id, conversation.user_id, action)
                 else:
-                    final_reply = (
+                    outcome = (
                         check_demo_refund_request(session, source.id, source.content, conversation.user_id)
                         or reply
                     )
         if job.kind != "RESUME_EXECUTION":
-            if final_reply is not None:
-                append_final_reply(session, conversation, source.id, final_reply)
-            else:
+            if isinstance(outcome, ResolutionProposal):
                 conversation.updated_at = func.clock_timestamp()
+                session.flush([outcome])
+                events = [
+                    EventToAppend(
+                        "proposal.created",
+                        {
+                            "proposal_id": str(outcome.id),
+                            "execution_id": str(outcome.execution_id),
+                            "source_message_id": str(source.id),
+                            "status": "WAITING_FOR_APPROVAL",
+                        },
+                    )
+                ]
+            else:
+                message = append_final_reply(session, conversation, source.id, outcome)
+                events = [message_created_event(message)]
+        transition_owned_job(
+            session,
+            claim,
+            job,
+            conversation.id,
+            status="SUCCEEDED",
+            preceding_events=events,
+            agent_deadline=step is not None,
+        )
         if step is not None:
             check_deadline(session, job)
-        session.flush()
-        if step is not None:
-            check_deadline(session, job)
-        # Recheck live time after lock waits so an expired claim rolls back all its writes.
-        # 锁等待后再次按实时时间校验，领取过期时回滚本次写入的所有记录。
-        changed = session.execute(
-            update(Job)
-            .where(owned_job(claim))
-            .values(
-                status="SUCCEEDED",
-                lease_owner=None,
-                lease_token=None,
-                lease_expires_at=None,
-                finished_at=func.clock_timestamp(),
-                updated_at=func.clock_timestamp(),
-                last_error=None,
-            )
-            .execution_options(synchronize_session=False)
-        ).rowcount
-        if changed != 1:
-            # Raising here also rolls back the check result, proposal, reply and sequence.
-            # 此处抛出异常，也会回滚资格记录、方案、退款和回复。
-            raise LostLease()
 
 
 # Record a sanitized failure only while this worker still owns the job.
 # 仅在仍持有领取权时记录经过简化的错误。
 def fail_job(claim: Claim, error: Exception):
-    """Record only an exception type, and only while this attempt still owns the job.
-    只在仍持有领取权时记录异常类型，避免保存可能含密钥或提供商正文的异常信息。
+    """Record a sanitized failure and publish it only while the lease remains valid.
+    仅在租约有效时保存经过简化的失败信息并记录事件。
     """
-    with SessionLocal.begin() as session:
-        session.execute(
-            update(Job)
-            .where(owned_job(claim))
-            .values(
+    try:
+        with SessionLocal.begin() as session:
+            job, conversation_id = lock_owned_job(session, claim)
+            transition_owned_job(
+                session,
+                claim,
+                job,
+                conversation_id,
                 status="FAILED",
-                lease_owner=None,
-                lease_token=None,
-                lease_expires_at=None,
-                finished_at=func.clock_timestamp(),
-                updated_at=func.clock_timestamp(),
                 last_error=f"Message processing failed ({type(error).__name__})",
             )
-        )
+    except LostLease:
+        # The transaction has rolled back. The worker holding the new lease owns publication.
+        # 事务已回滚，由持有新租约的 worker 负责记录结果。
+        return
 
 
 # Process at most one claim; stale attempts cannot write a reply.

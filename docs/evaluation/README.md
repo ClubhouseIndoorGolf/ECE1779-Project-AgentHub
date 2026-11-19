@@ -104,3 +104,28 @@ relaxed. The final complete run passed; the local clock caveat above still appli
 The earlier benchmark artifact remains tied to its recorded implementation
 revision and was not relabeled as a new benchmark. No live provider calls or cloud
 deployment were performed during this merge.
+
+## November 18 integration with durable replay
+
+Merged `origin/main` at `eaec131`, including PR #7's durable SSE replay and the
+application/data backlog. Resolved overlapping worker changes so agent proposals,
+replies and approved resolutions record their events in the same fenced business
+transaction. Detailed invalidation evidence remains available through history and
+the durable invalidation payload. An expired agent deadline rolls back terminal
+checkpoints, proposals and their events together.
+
+The new schema head `0008_merge_agent_events` joins the unchanged independent
+`0007_agent_steps` and `0007_conversation_events` revisions. Regression tests upgrade
+from each branch with populated records and verify preservation. The event-store
+migration fixture targets its own branch when downgrading, retaining agent audit
+fields. The running local stack upgraded from the previous agent schema to this
+single merge head successfully.
+
+Fresh checks on the merged source: **178 backend tests passed**, **20 browser
+tests passed**, Ruff lint/format passed (43 Python files), Compose configuration
+and both image builds passed, and the running fixed-mode API/worker smoke passed
+including duplicate submission. A real HTTP v2 stream verified the history
+snapshot cursor, five ordered message/job events and an exact reconnect replay
+after `v2:3`. This was local container verification; no paid model calls, cloud
+deployment or new scaling benchmark was performed. The existing upstream
+TestClient deprecation warning remains non-failing.

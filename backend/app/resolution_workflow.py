@@ -2,11 +2,12 @@
 在与待办和聊天状态共用的数据库中管理审批处置。
 """
 
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, aliased
 
+from app.event_store import EventToAppend, append_events, message_created_event
 from app.models import (
     AppliedResolution,
     Conversation,
@@ -25,40 +26,65 @@ PROPOSAL_VERSION = 1
 EXPIRED_REPLY = "The refund proposal expired. Request a new proposal to continue."
 
 
-def append_final_reply(session: Session, conversation: Conversation, source_id: UUID, reply: str):
-    """Stage the final reply and allocate its sequence under the conversation lock.
-    在持有会话锁时暂存最终回复并分配顺序号。
+def append_final_reply(session: Session, conversation: Conversation, source_id: UUID, reply: str) -> Message:
+    """Stage a final reply with its ID and sequence available for the event batch.
+    暂存最终回复，并为事件批次分配可引用的消息编号和顺序号。
     """
-    session.add(
-        Message(
-            conversation_id=conversation.id,
-            role="assistant",
-            content=reply,
-            seq=conversation.next_message_seq,
-            reply_to_message_id=source_id,
-        )
+    message = Message(
+        id=uuid4(),
+        conversation_id=conversation.id,
+        role="assistant",
+        content=reply,
+        seq=conversation.next_message_seq,
+        reply_to_message_id=source_id,
     )
+    session.add(message)
     conversation.next_message_seq += 1
     conversation.updated_at = func.clock_timestamp()
+    return message
 
 
 def close_proposal(
+    session: Session, conversation: Conversation, execution: Execution, status: str, reply: str
+) -> Message:
+    """Stage a terminal proposal state and return its final chat reply.
+    暂存方案终态并返回最终聊天回复。
+    """
+    execution.status = status
+    return append_final_reply(session, conversation, execution.source_message_id, reply)
+
+
+def invalidate_proposal(
     session: Session,
     conversation: Conversation,
     execution: Execution,
-    status: str,
+    proposal_id: UUID,
+    reason: str,
     reply: str,
     *,
-    reason: str | None = None,
-):
-    """Save a terminal proposal state and its final chat reply together.
-    将方案终态和最终聊天回复一起保存。
+    audit_reason: str | None = None,
+) -> list[EventToAppend]:
+    """Stage an invalidation and describe the outcome and the reply in causal order.
+    暂存方案失效状态，并按发生顺序描述结果和回复。
     """
-    execution.status = status
-    if status == "INVALIDATED":
-        execution.invalidation_reason = reason or "PROPOSAL_EXPIRED"
-        execution.revalidated_at = session.scalar(select(func.clock_timestamp()))
-    append_final_reply(session, conversation, execution.source_message_id, reply)
+    execution.invalidation_reason = audit_reason or ("PROPOSAL_EXPIRED" if reason == "EXPIRED" else reason)
+    execution.revalidated_at = session.scalar(select(func.clock_timestamp()))
+    message = close_proposal(session, conversation, execution, "INVALIDATED", reply)
+    return [
+        EventToAppend(
+            "resolution.invalidated",
+            {
+                "proposal_id": str(proposal_id),
+                "execution_id": str(execution.id),
+                "source_message_id": str(execution.source_message_id),
+                "status": "INVALIDATED",
+                "reason": reason,
+                "invalidation_reason": execution.invalidation_reason,
+                "revalidated_at": execution.revalidated_at.isoformat(),
+            },
+        ),
+        message_created_event(message),
+    ]
 
 
 def active_resolution_exists(session: Session, conversation_id: UUID) -> bool:
@@ -123,7 +149,7 @@ def expire_pending_proposal(session: Session) -> bool:
     # Lock the conversation first, as the decision API does, and verify the state again after locking.
     # 与审批接口一样先锁定会话，取得锁后再次核对方案状态。
     row = session.execute(
-        select(Conversation, Execution.id, Message.seq)
+        select(Conversation, Execution.id, Message.seq, ResolutionProposal.id)
         .join(Message, Message.conversation_id == Conversation.id)
         .join(Execution, Execution.source_message_id == Message.id)
         .join(ResolutionProposal, ResolutionProposal.execution_id == Execution.id)
@@ -138,7 +164,7 @@ def expire_pending_proposal(session: Session) -> bool:
     ).one_or_none()
     if row is None:
         return False
-    conversation, execution_id, source_seq = row
+    conversation, execution_id, source_seq, proposal_id = row
     execution = session.get(Execution, execution_id, with_for_update=True)
     if execution.status != "WAITING_FOR_APPROVAL":
         return False
@@ -146,13 +172,14 @@ def expire_pending_proposal(session: Session) -> bool:
     # 在写入最终回复前，持有会话锁再次读取前序轮次状态。
     if session.scalar(select(unfinished_turn_before(conversation.id, source_seq))):
         return False
-    close_proposal(session, conversation, execution, "INVALIDATED", EXPIRED_REPLY)
+    events = invalidate_proposal(session, conversation, execution, proposal_id, "EXPIRED", EXPIRED_REPLY)
+    append_events(session, conversation.id, events)
     return True
 
 
-def apply_approved_resolution(session: Session, job: Job, conversation: Conversation):
-    """Stage the approved simulated action and final reply inside the worker's fenced transaction.
-    在 worker 的租约保护事务中暂存已批准的模拟动作和最终回复。
+def apply_approved_resolution(session: Session, job: Job, conversation: Conversation) -> list[EventToAppend]:
+    """Stage the simulated action and return the events for the worker's fenced commit.
+    暂存模拟动作，并返回由 worker 在租约保护下提交的事件。
     """
     execution, proposal, decision = session.execute(
         select(Execution, ResolutionProposal, ProposalDecision)
@@ -179,8 +206,7 @@ def apply_approved_resolution(session: Session, job: Job, conversation: Conversa
     )
     execution.revalidated_at = now
     if now >= proposal.expires_at:
-        close_proposal(session, conversation, execution, "INVALIDATED", EXPIRED_REPLY)
-        return
+        return invalidate_proposal(session, conversation, execution, proposal.id, "EXPIRED", EXPIRED_REPLY)
     reason = None
     if order is None or ticket is None:
         reason = "FACTS_UNAVAILABLE"
@@ -201,15 +227,15 @@ def apply_approved_resolution(session: Session, job: Job, conversation: Conversa
     elif order_facts(order) != proposal.expected_order_facts:
         reason = "ORDER_CHANGED"
     if reason:
-        close_proposal(
+        return invalidate_proposal(
             session,
             conversation,
             execution,
-            "INVALIDATED",
+            proposal.id,
+            "BUSINESS_STATE_CHANGED",
             "The refund proposal no longer matches the ticket or order. Request a new proposal.",
-            reason=reason,
+            audit_reason=reason,
         )
-        return
 
     # Recalculate the amount at application time using the current policy and locked facts.
     # 使用当前退款规则和已锁定的订单资料重新计算执行金额。
@@ -218,15 +244,14 @@ def apply_approved_resolution(session: Session, job: Job, conversation: Conversa
         execution.refund_amount_minor,
         execution.currency,
     ):
-        close_proposal(
+        return invalidate_proposal(
             session,
             conversation,
             execution,
-            "INVALIDATED",
+            proposal.id,
+            "ELIGIBILITY_CHANGED",
             "The order no longer qualifies for the approved refund. Request a new proposal.",
-            reason="ELIGIBILITY_CHANGED",
         )
-        return
 
     # The refund, exact customer reply, ticket update, and job completion commit as one unit.
     # 退款、原样客户回复、工单变更与待办完成作为一个事务提交。
@@ -243,7 +268,7 @@ def apply_approved_resolution(session: Session, job: Job, conversation: Conversa
     )
     ticket.status = proposal.proposed_ticket_status
     dollars, cents = divmod(result.refund_amount_minor, 100)
-    close_proposal(
+    message = close_proposal(
         session,
         conversation,
         execution,
@@ -251,3 +276,18 @@ def apply_approved_resolution(session: Session, job: Job, conversation: Conversa
         f"Applied a simulated refund of {result.currency} {dollars}.{cents:02d} to order {order.id}, "
         f"recorded the customer reply, and resolved ticket {ticket.id}.",
     )
+    # Passage through the worker's final lease check is required to persist either event.
+    # 只有通过 worker 的最后一次租约检查，这两条事件才会持久化。
+    return [
+        EventToAppend(
+            "resolution.completed",
+            {
+                "proposal_id": str(proposal.id),
+                "execution_id": str(execution.id),
+                "source_message_id": str(execution.source_message_id),
+                "job_id": str(job.id),
+                "status": "COMPLETED",
+            },
+        ),
+        message_created_event(message),
+    ]

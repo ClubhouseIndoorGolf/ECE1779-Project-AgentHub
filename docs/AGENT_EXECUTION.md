@@ -69,6 +69,11 @@ Migration **`0007_agent_steps`**, following `0006_approved_resolutions`, adds:
 - `executions.revalidated_at` and `invalidation_reason`, separate from the original
   planning evidence.
 
+The merged schema head is **`0008_merge_agent_events`**. It joins the unchanged
+`0007_agent_steps` and `0007_conversation_events` revisions, both based on `0006`.
+`alembic upgrade head` works from either branch and preserves existing checkpoints
+and event records; no applied revision was renamed or rewritten.
+
 Apply migrations before starting the new API/worker images. Keep API and workers
 on the same release; old workers do not understand pending agent checkpoints.
 Before rollout, the data/API owner should review this additive migration and the
@@ -88,6 +93,15 @@ PR #6's SSE transport is integrated on this branch. REST and SSE share the propo
 serializer in `history.py`, including revalidation time and invalidation reason.
 The stream currently carries message, job and proposal updates; individual tool
 steps remain available through the authenticated REST endpoint above.
+
+PR #7's durable replay is also integrated. Agent-generated proposals, terminal
+replies, job transitions and approved resolutions append events in their business
+transaction. Completion checks the lease and agent deadline after waiting for the
+event counter, so late results roll back both business changes and events. Durable
+invalidation events retain the existing broad `reason` and additionally expose
+`invalidation_reason` and `revalidated_at` matching the execution audit record.
+Clients opt into `version=2` using the history snapshot's `v2:` cursor; the existing
+browser continues to use the compatible default stream. See [Live updates](LIVE_UPDATES.md).
 
 The SSE owner can later publish each completed row once using `(job_id, seq)` as the
 stable identity, replay after the cursor, and use existing job/history state for

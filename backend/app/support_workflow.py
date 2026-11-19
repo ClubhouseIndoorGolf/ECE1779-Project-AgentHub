@@ -133,9 +133,11 @@ def check_demo_refund_request(session: Session, source_id: UUID, content: str, u
     return prefix + format_refund_reply(order_id, result)
 
 
-def prepare_refund(session: Session, source_id: UUID, user_id: UUID, action: PrepareRefund) -> str | None:
-    """Stage a proposal and return None, or return a read-only explanation when blocked.
-    暂存方案并返回 None；无法准备方案时，返回只读原因说明。
+def prepare_refund(
+    session: Session, source_id: UUID, user_id: UUID, action: PrepareRefund
+) -> str | ResolutionProposal:
+    """Return the staged proposal for publication, or a read-only explanation when blocked.
+    返回已暂存的方案供调用方记录事件。无法准备方案时返回只读原因说明。
     """
     # Resolve the account-scoped facts before evaluating any model- or user-proposed action.
     # 处理用户或模型提出的动作前，先读取当前账号有权访问的业务资料。
@@ -169,14 +171,13 @@ def prepare_refund(session: Session, source_id: UUID, user_id: UUID, action: Pre
     # 固定待审批动作的具体内容，并保存执行前需要重新核验的业务事实。
     execution.status = "WAITING_FOR_APPROVAL"
     session.flush([execution])
-    session.add(
-        ResolutionProposal(
-            execution_id=execution.id,
-            ticket_id=action.ticket_id,
-            customer_reply=customer_reply,
-            proposed_ticket_status="RESOLVED",
-            expected_order_facts=order_facts(order),
-            expires_at=expires_at,
-        )
+    proposal = ResolutionProposal(
+        execution_id=execution.id,
+        ticket_id=action.ticket_id,
+        customer_reply=customer_reply,
+        proposed_ticket_status="RESOLVED",
+        expected_order_facts=order_facts(order),
+        expires_at=expires_at,
     )
-    return None
+    session.add(proposal)
+    return proposal

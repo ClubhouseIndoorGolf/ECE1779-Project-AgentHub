@@ -16,11 +16,11 @@ from test_resolution_workflow import decide, submit
 from test_resolution_workflow import demo_tickets as demo_tickets
 from test_worker_chat import model_client
 
-from app.agent import run_agent
+from app.agent import AgentBudgetExceeded, run_agent
 from app.agent_contract import Decision
 from app.db import SessionLocal
 from app.leases import LostLease
-from app.models import AgentStep, Job
+from app.models import AgentStep, ConversationEvent, Execution, Job, ResolutionProposal
 from app.replies import OpenAIReply, ReplySettings, RetryableReplyError
 from app.worker import claim_job, complete_job, run_once
 
@@ -203,6 +203,40 @@ def test_pending_steps_are_hidden_until_stably_cursorable(client):
     complete_job(claim, agent_step=seq)
     assert len(client.get(url).json()) == 1
     assert client.get(url + "?after_seq=1").json() == []
+
+
+def test_agent_deadline_after_event_append_rolls_back_proposal_and_events(client, demo_tickets, monkeypatch):
+    """An event-counter wait must not allow an expired terminal decision to commit.
+    等待事件计数器不能让已超时的终结决策提交。
+    """
+    from app import worker
+
+    _, _, receipt = submit(client, "Prepare ticket 391")
+    claim = claim_job("agent-events")
+    seq = run_agent(claim, workflow(), [], ReplySettings())
+    with SessionLocal() as session:
+        before = session.scalar(select(func.count()).select_from(ConversationEvent))
+    original = worker.append_events
+
+    def expire_after_append(session, conversation_id, events):
+        result = original(session, conversation_id, events)
+        session.get(Job, claim.job_id).agent_deadline_at = session.scalar(
+            select(func.clock_timestamp())
+        ) - timedelta(seconds=1)
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(worker, "append_events", expire_after_append)
+        with pytest.raises(AgentBudgetExceeded):
+            complete_job(claim, agent_step=seq)
+    with SessionLocal() as session:
+        assert session.scalar(select(func.count()).select_from(ConversationEvent)) == before
+        assert session.scalar(select(ResolutionProposal)) is None
+        assert session.scalar(select(Execution)) is None
+        assert session.get(AgentStep, (claim.job_id, seq)).result is None
+        assert session.get(Job, claim.job_id).status == "RUNNING"
+    complete_job(claim, agent_step=seq)
+    assert client.get(f"/jobs/{receipt['job_id']}").json()["status"] == "SUCCEEDED"
 
 
 @pytest.mark.parametrize(

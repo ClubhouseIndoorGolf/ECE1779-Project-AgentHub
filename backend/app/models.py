@@ -88,6 +88,41 @@ class Conversation(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
 
 
+# A separate counter serializes event writers without locking the conversation row.
+# 独立计数器使事件写入串行化，无须锁定会话行。
+class ConversationEventHead(Base):
+    __tablename__ = "conversation_event_heads"
+    __table_args__ = (CheckConstraint("last_event_seq >= 0", name="ck_conversation_event_heads_seq"),)
+
+    conversation_id: Mapped[UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="RESTRICT"), primary_key=True
+    )
+    last_event_seq: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
+
+
+# The composite key also supports ordered replay from an exclusive cursor.
+# 复合主键也用于从不含起点的游标按序回放事件。
+class ConversationEvent(Base):
+    __tablename__ = "conversation_events"
+    __table_args__ = (
+        CheckConstraint("seq > 0", name="ck_conversation_events_seq"),
+        CheckConstraint("event_type ~ '[^[:space:]]'", name="ck_conversation_events_type"),
+        CheckConstraint("jsonb_typeof(payload) = 'object'", name="ck_conversation_events_payload"),
+    )
+
+    # Reference the counter so inserts only take a foreign-key lock on the row already held by the writer.
+    # 引用计数器，使插入事件时的外键锁仅落在写入方已锁定的记录上。
+    conversation_id: Mapped[UUID] = mapped_column(
+        ForeignKey("conversation_event_heads.conversation_id", ondelete="RESTRICT"), primary_key=True
+    )
+    seq: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    event_type: Mapped[str] = mapped_column(Text)
+    payload: Mapped[dict] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("clock_timestamp()")
+    )
+
+
 # A user request or its single final assistant reply.
 # 一条用户请求，或其唯一的最终系统回复。
 class Message(Base):
