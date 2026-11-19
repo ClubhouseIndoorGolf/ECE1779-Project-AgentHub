@@ -141,7 +141,7 @@ test("pushed activity refreshes saved progress once and restores it on reopening
   let progressStream;
   let reads = 0;
   const client = createClient(async (url, options) => {
-    if (url === "/conversations/chat-a/events") {
+    if (url === "/conversations/chat-a/events?version=2") {
       progressStream = sseResponse(options.signal);
       return progressStream.response;
     }
@@ -156,8 +156,8 @@ test("pushed activity refreshes saved progress once and restores it on reopening
   t.after(() => client.run("newChat()"));
   await client.run("authorization = 'Basic test'; openConversation({id:'chat-a',title:'Chat A'})");
   await until(() => progressStream);
-  progressStream.push('event: activity\ndata: {"job_id":"job-1"}\n\n');
-  progressStream.push('event: activity\ndata: {"job_id":"job-1"}\n\n');
+  progressStream.push('id: v2:3\nevent: agent.step_completed\ndata: {"conversation_id":"chat-a","type":"agent.step_completed","payload":{"job_id":"job-1"}}\n\n');
+  progressStream.push('id: v2:3\nevent: agent.step_completed\ndata: {"conversation_id":"chat-a","type":"agent.step_completed","payload":{"job_id":"job-1"}}\n\n');
   await until(() => visibleText(client.element("messages")).includes("Retrieved ticket and order"));
   assert.equal(reads, 2);
   assert.equal(client.element("messages").children[1].children[0].children.length, 2);
@@ -256,6 +256,8 @@ function createClient(handler, extraGlobals = {}) {
    */
   async function fetchClient(url, options) {
     if (url === "/health") return response({ reply_mode: "fixed" });
+    if (url.endsWith("/messages?after_seq=0&limit=1") && !extraGlobals.snapshotFetch)
+      return { ok: true, headers: { get: () => "v2:0" } };
     return handler(url, options);
   }
 
@@ -563,7 +565,7 @@ test("a pushed job event completes a send without polling the job", async t => {
   const user = { seq: 1, role: "user", content: "Hi" };
   const assistant = { seq: 2, role: "assistant", content: "Message received." };
   const client = createClient(async (url, options) => {
-    if (url === "/conversations/chat-a/events") {
+    if (url === "/conversations/chat-a/events?version=2") {
       stream = sseResponse(options.signal);
       return stream.response;
     }
@@ -578,7 +580,7 @@ test("a pushed job event completes a send without polling the job", async t => {
   t.after(() => client.run("newChat()"));
   await client.run("authorization = 'Basic test'; openConversation({ id: 'chat-a', title: 'Chat A' })");
   await until(() => stream);
-  stream.push('retry: 2000\n\nid: 0\nevent: ready\ndata: {"cursor":0}\n\n');
+  stream.push('retry: 2000\n\nevent: ready\ndata: {"cursor":"v2:0"}\n\n');
   await until(() => client.run("streamLive()"));
   assert.equal(client.element("connection-label").textContent, "Live updates");
 
@@ -587,8 +589,8 @@ test("a pushed job event completes a send without polling the job", async t => {
   done = true;
   // Split one frame across chunks to exercise buffering.
   // 将一个事件帧拆成两段发送，以验证缓冲解析。
-  stream.push('event: job\ndata: {"id":"job-1","status":"SUCC');
-  stream.push('EEDED","last_error":null}\n\n');
+  stream.push('id: v2:2\nevent: job.status_changed\ndata: {"conversation_id":"chat-a","type":"job.status_changed","payload":{"job_id":"job-1","status":"SUCC');
+  stream.push('EEDED","last_error":null}}\n\n');
   await sending;
   assert.equal(jobPolls, 0);
   const rows = client.element("messages").children;
@@ -597,10 +599,10 @@ test("a pushed job event completes a send without polling the job", async t => {
   assert.equal(client.element("connection-label").textContent, "Local workspace");
 });
 
-test("a dropped stream reconnects with the last message sequence", async t => {
+test("a dropped stream reconnects with the last complete durable event ID", async t => {
   const attempts = [];
   const client = createClient(async (url, options) => {
-    if (url === "/conversations/chat-a/events") {
+    if (url === "/conversations/chat-a/events?version=2") {
       const stream = sseResponse(options.signal);
       attempts.push({ headers: options.headers, stream });
       return stream.response;
@@ -614,21 +616,21 @@ test("a dropped stream reconnects with the last message sequence", async t => {
   t.after(() => client.run("newChat()"));
   await client.run("authorization = 'Basic test'; openConversation({ id: 'chat-a', title: 'Chat A' })");
   await until(() => attempts.length === 1);
-  assert.equal(attempts[0].headers["Last-Event-ID"], undefined);
-  attempts[0].stream.push('id: 2\nevent: ready\ndata: {"cursor":2}\n\n: keepalive\n\n');
-  attempts[0].stream.push('id: 3\nevent: message\ndata: {"seq":3}\n\n');
-  await until(() => client.run("stream.lastSeq") === 3);
+  assert.equal(attempts[0].headers["Last-Event-ID"], "v2:0");
+  attempts[0].stream.push('event: ready\ndata: {"cursor":"v2:2"}\n\n: keepalive\n\n');
+  attempts[0].stream.push('id: v2:3\nevent: message.created\ndata: {"conversation_id":"chat-a","type":"message.created","payload":{"message_seq":3}}\n\n');
+  await until(() => client.run("stream.cursor") === "v2:3");
   attempts[0].stream.close();
   await until(() => client.element("connection-label").textContent === "Reconnecting…");
   await until(() => attempts.length === 2);
-  assert.equal(attempts[1].headers["Last-Event-ID"], "3");
+  assert.equal(attempts[1].headers["Last-Event-ID"], "v2:3");
   client.run("newChat()");
 });
 
 test("a refused stream falls back to polling without retrying", async t => {
   let opens = 0;
   const client = createClient(async url => {
-    if (url === "/conversations/chat-a/events") { opens++; return { ok: false, status: 404 }; }
+    if (url === "/conversations/chat-a/events?version=2") { opens++; return { ok: false, status: 404 }; }
     if (url.includes("/messages?")) return response([]);
     throw new Error("Unexpected request: " + url);
   }, streamingGlobals);
@@ -645,7 +647,7 @@ test("a refused stream falls back to polling without retrying", async t => {
 test("a failed refresh after a pushed message retries while the stream only sends heartbeats", async t => {
   let stream, historyReads = 0;
   const client = createClient(async (url, options) => {
-    if (url === "/conversations/chat-a/events") {
+    if (url === "/conversations/chat-a/events?version=2") {
       stream = sseResponse(options.signal);
       return stream.response;
     }
@@ -664,9 +666,9 @@ test("a failed refresh after a pushed message retries while the stream only send
   t.after(() => client.run("newChat()"));
   await client.run("authorization = 'Basic test'; openConversation({ id: 'chat-a', title: 'Chat A' })");
   await until(() => stream);
-  stream.push('id: 0\nevent: ready\ndata: {"cursor":0}\n\n');
+  stream.push('event: ready\ndata: {"cursor":"v2:0"}\n\n');
   await until(() => historyReads === 2);
-  stream.push('id: 1\nevent: message\ndata: {"seq":1}\n\n: keepalive\n\n');
+  stream.push('id: v2:1\nevent: message.created\ndata: {"conversation_id":"chat-a","type":"message.created","payload":{"message_seq":1}}\n\n: keepalive\n\n');
   await until(() => historyReads === 3);
   await until(() => client.element("messages").children.length === 1, 4000);
   assert.equal(client.element("messages").children[0].children[1].textContent, "From another tab");
@@ -694,7 +696,7 @@ test("a polled job state is not replaced by an older cached state", async () => 
 test("a 401 history refresh stops retrying and asks the user to sign in again", async t => {
   let stream, historyReads = 0, loginOpened = 0;
   const client = createClient(async (url, options) => {
-    if (url === "/conversations/chat-a/events") {
+    if (url === "/conversations/chat-a/events?version=2") {
       stream = sseResponse(options.signal);
       return stream.response;
     }
@@ -709,9 +711,9 @@ test("a 401 history refresh stops retrying and asks the user to sign in again", 
   client.element("login-panel").showModal = () => { loginOpened++; };
   await client.run("authorization = 'Basic test'; openConversation({ id: 'chat-a', title: 'Chat A' })");
   await until(() => stream);
-  stream.push('id: 0\nevent: ready\ndata: {"cursor":0}\n\n');
+  stream.push('event: ready\ndata: {"cursor":"v2:0"}\n\n');
   await until(() => historyReads === 2);
-  stream.push('id: 1\nevent: message\ndata: {"seq":1}\n\n');
+  stream.push('id: v2:1\nevent: message.created\ndata: {"conversation_id":"chat-a","type":"message.created","payload":{"message_seq":1}}\n\n');
   await until(() => loginOpened === 1);
   assert.equal(client.run("stream"), null);
   assert.equal(client.element("notice").textContent, "Your session has expired. Please sign in again.");
@@ -724,7 +726,7 @@ test("a 401 history refresh stops retrying and asks the user to sign in again", 
 test("a 401 stream asks for sign-in and resumes live updates after signing in", async t => {
   let opens = 0, loginOpened = 0;
   const client = createClient(async (url, options) => {
-    if (url === "/conversations/chat-a/events") {
+    if (url === "/conversations/chat-a/events?version=2") {
       opens++;
       if (opens === 1) return { ok: false, status: 401 };
       return sseResponse(options.signal).response;
@@ -761,7 +763,7 @@ test("signing in as another account after a 401 clears the old workspace during 
     const isBob = options.headers.Authorization === "Basic " + Buffer.from("bob:password").toString("base64");
     if (url === "/me") return response(isBob ? { id: "bob-id", username: "bob" } : { id: "alice-id", username: "alice" });
     if (url === "/conversations") return response(isBob ? [{ id: "chat-b", title: "Bob chat" }] : [{ id: "chat-a", title: "Alice chat" }]);
-    if (url === "/conversations/chat-a/events") {
+    if (url === "/conversations/chat-a/events?version=2") {
       streamOpens++;
       stream = sseResponse(options.signal);
       return stream.response;
@@ -795,7 +797,7 @@ test("signing in as another account after a 401 clears the old workspace during 
   const sending = client.send("Alice draft");
   await until(() => aliceSubmission);
 
-  stream.push('id: 1\nevent: ready\ndata: {"cursor":1}\n\n');
+  stream.push('event: ready\ndata: {"cursor":"v2:1"}\n\n');
   await until(() => loginOpened === 1);
   client.element("username").value = "bob";
   client.element("password").value = "password";
@@ -815,4 +817,57 @@ test("signing in as another account after a 401 clears the old workspace during 
   assert.equal(client.element("message").value, "Bob draft");
   assert.equal(client.element("notice").textContent, "");
   assert.equal(aliceJobPolls, 0);
+});
+
+test("a rejected snapshot cursor is replaced and replayed duplicates are ignored", async t => {
+  const cursors = [];
+  let snapshots = 0;
+  const client = createClient(async (url, options) => {
+    if (url.endsWith("&limit=1")) {
+      snapshots++;
+      const value = snapshots === 1 ? "v2:99" : "v2:9007199254740992";
+      return { ok: true, headers: { get: key => key === "X-Conversation-Event-Cursor" ? value : null } };
+    }
+    if (url.endsWith("/events?version=2")) {
+      cursors.push(options.headers["Last-Event-ID"]);
+      if (cursors.length === 1) return { status: 422, ok: false };
+      return sseResponse(options.signal).response;
+    }
+    return response([]);
+  }, { ...streamingGlobals, snapshotFetch: true });
+  t.after(() => client.run("stopStream()"));
+  await client.run("authorization = 'Basic test'; openConversation({id:'chat-a', title:'A'})");
+  await until(() => cursors.length === 2);
+  assert.deepEqual(cursors, ["v2:99", "v2:9007199254740992"]);
+  const changes = client.run(`(() => {
+    let changes = 0;
+    scheduleRefresh = () => changes++;
+    const event = { id: "v2:9007199254740993", event: "agent.step_completed",
+      data: JSON.stringify({ conversation_id: "chat-a", type: "agent.step_completed", payload: {} }) };
+    handleFrame(stream, event);
+    handleFrame(stream, event);
+    return changes;
+  })()`);
+  assert.equal(changes, 1);
+  assert.equal(client.run("stream.cursor"), "v2:9007199254740993");
+});
+
+test("a saved execution opens from history and displays only an applied refund as paid", async () => {
+  let applied = false;
+  const client = createClient(async url => {
+    assert.equal(url, "/executions/ex-1");
+    return response({ outcome: "ELIGIBLE", order_id: "1002", reason_codes: [], status: "COMPLETED",
+      result: applied ? { refund_amount_minor: "9007199254740993", currency: "CAD" } : null });
+  });
+  const dialog = client.element("execution-panel");
+  dialog.showModal = () => { dialog.open = true; };
+  client.run("showMessages([{role:'user', content:'Refund', execution_id:'ex-1'}])");
+  const click = client.element("messages").children[0].children[2].listeners.get("click");
+  await click();
+  const values = () => client.element("execution-fields").children.map(el => el.textContent);
+  assert.ok(values().includes("ELIGIBLE"));
+  assert.ok(!values().includes("Refund applied"));
+  applied = true;
+  await click();
+  assert.ok(values().includes("CAD 90071992547409.93"));
 });

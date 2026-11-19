@@ -243,13 +243,13 @@ function startStream() {
   if (stream && stream.conversation === conversation && stream.authorization === authorization) return;
   stopStream();
   if (!streamingSupported || !authorization || !conversation) return;
-  const current = { conversation, authorization, controller: new AbortController(), live: false, lastSeq: null };
+  const current = { conversation, authorization, controller: new AbortController(), live: false, cursor: null };
   stream = current;
   runStream(current);
 }
 
-/** Keep one conversation stream connected, resuming from the last message sequence after drops.
- * 保持单个会话事件流连接；断线后从最后收到的消息顺序号续传。
+/** Keep one conversation stream connected, resuming from the last complete event after drops.
+ * 保持单个会话事件流连接；断线后从最后完整处理的事件游标续传。
  */
 async function runStream(current) {
   let delay = 1000;
@@ -263,10 +263,28 @@ async function runStream(current) {
     let idle = setTimeout(stop, STREAM_IDLE_MS);
     try {
       const headers = { Authorization: current.authorization };
-      if (current.lastSeq !== null) headers["Last-Event-ID"] = String(current.lastSeq);
-      const response = await fetch("/conversations/" + current.conversation + "/events", {
+      const base = "/conversations/" + current.conversation;
+      if (current.cursor === null) {
+        // Read a first-page snapshot before subscribing. The ready refresh loads full history.
+        const snapshot = await fetch(base + "/messages?after_seq=0&limit=1", {
+          headers, cache: "no-store", signal: attempt.signal,
+        });
+        if (stream !== current) return;
+        if (snapshot.status === 401) { authExpired(current); return; }
+        if (snapshot.status === 404) { connection(); return; }
+        if (!snapshot.ok) throw new Error("History snapshot unavailable");
+        const cursor = snapshot.headers.get("X-Conversation-Event-Cursor");
+        if (!/^v2:[0-9]+$/.test(cursor)) throw new Error("Missing history cursor");
+        current.cursor = cursor;
+      }
+      headers["Last-Event-ID"] = current.cursor;
+      const response = await fetch(base + "/events?version=2", {
         headers, cache: "no-store", signal: attempt.signal,
       });
+      if (response.status === 422) {
+        current.cursor = null;
+        throw new Error("Refresh the history cursor");
+      }
       if (response.status === 401) { authExpired(current); return; }
       if (response.status === 404) {
         // Ownership changed; polling remains available and reports the error.
@@ -341,20 +359,26 @@ function handleFrame(current, frame) {
   if (!frame || stream !== current) return true;
   let data;
   try { data = JSON.parse(frame.data); } catch { return true; }
-  if (frame.id !== null && /^\d+$/.test(frame.id)) current.lastSeq = Number(frame.id);
+  if (frame.event === "error") return false;
   if (frame.event === "ready") {
     current.live = true;
     connection("live");
-    // Catch up on anything committed between the last history read and this connection.
-    // 补齐上次读取历史之后、本次连接建立之前提交的变化。
     scheduleRefresh();
-  } else if (frame.event === "conversation.deleted") {
+    return true;
+  }
+  if (frame.event === "conversation.deleted" && data.conversation_id === current.conversation) {
     drafts.delete(conversation);
     resetChat();
     listConversations().catch(error => notice(error.message));
-  } else if (frame.event === "job") { noteJob(data); scheduleRefresh(); }
-  else if (frame.event === "message" || frame.event === "proposal" || frame.event === "activity") scheduleRefresh();
-  else if (frame.event === "error") return false;
+    return true;
+  }
+  if (!/^v2:[0-9]+$/.test(frame.id) || data.conversation_id !== current.conversation ||
+      frame.event !== data.type || !data.payload) return true;
+  if (BigInt(frame.id.slice(3)) <= BigInt(current.cursor.slice(3))) return true;
+  if (frame.event === "job.status_changed") noteJob(data.payload, data.payload.job_id);
+  // History contains the saved message, approval, refund and agent activity projections.
+  scheduleRefresh();
+  current.cursor = frame.id;
   return true;
 }
 
@@ -454,8 +478,7 @@ function renderProposal(proposal) {
 
   // Split the decimal digits without converting BIGINT cents to a JavaScript number.
   // 直接拆分十进制数字，避免将 BIGINT 金额转换成 JavaScript 浮点数。
-  const digits = proposal.refund_amount_minor.padStart(3, "0");
-  const amount = proposal.currency + " " + digits.slice(0, -2) + "." + digits.slice(-2);
+  const amount = formatRefund(proposal.refund_amount_minor, proposal.currency);
   const details = document.createElement("dl");
   for (const [name, value] of [
     ["Ticket", "#" + proposal.ticket_id],
@@ -504,6 +527,53 @@ function renderProposal(proposal) {
   return card;
 }
 
+function formatRefund(minor, currency) {
+  const digits = minor.padStart(3, "0");
+  return currency + " " + digits.slice(0, -2) + "." + digits.slice(-2);
+}
+
+let detailRequest = 0;
+
+function closeExecutionDetail() {
+  detailRequest++;
+  if ($("execution-panel").open) $("execution-panel").close();
+  $("execution-fields").replaceChildren();
+}
+
+async function openExecutionDetail(id) {
+  const request = ++detailRequest;
+  const panel = $("execution-panel");
+  const fields = $("execution-fields");
+  fields.replaceChildren();
+  $("execution-status").textContent = "Loading…";
+  if (!panel.open) panel.showModal();
+  try {
+    const detail = await api("/executions/" + encodeURIComponent(id));
+    if (request !== detailRequest || !panel.open) return;
+    const entries = [
+      ["Order", detail.order_id],
+      ["Eligibility", detail.outcome],
+      ["Reason", detail.reason_codes.join(", ")],
+      ["Workflow status", detail.status],
+      ["Decision", detail.decision?.decision],
+      ["Continuation", detail.resume_job_status],
+    ];
+    if (detail.result) entries.push(["Refund applied",
+      formatRefund(detail.result.refund_amount_minor, detail.result.currency)]);
+    for (const [name, value] of entries) {
+      if (!value) continue;
+      const term = document.createElement("dt");
+      const description = document.createElement("dd");
+      term.textContent = name;
+      description.textContent = value;
+      fields.append(term, description);
+    }
+    $("execution-status").textContent = "";
+  } catch (error) {
+    if (request === detailRequest && panel.open) $("execution-status").textContent = error.message;
+  }
+}
+
 /** Replace history with plain text messages and any proposals attached to their sources.
  * 以纯文本消息及其来源消息所附带的方案重建历史。
  */
@@ -523,6 +593,13 @@ function showMessages(rows, waiting = false) {
     // 始终通过 textContent 写入用户与模型内容，避免执行文本中的 HTML。
     text.textContent = row.content;
     article.append(label, text);
+    if (row.execution_id) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = "View refund details";
+      button.addEventListener("click", () => openExecutionDetail(row.execution_id));
+      article.append(button);
+    }
     $("messages").append(article);
     if (row.activity) $("messages").append(renderActivity(row.activity, row.proposal));
     // Rebuild cards from the same history snapshot as their originating messages.
@@ -847,6 +924,7 @@ function restoreDraft(id) {
 function resetChat() {
   closeChatMenu();
   closeChatAction();
+  closeExecutionDetail();
   generation++;
   pending = null;
   conversation = null;
@@ -899,6 +977,7 @@ async function openConversation(row) {
     // 发起新会话的历史请求前，清除上一会话中可操作的控件。
     showMessages([]);
   }
+  closeExecutionDetail();
   generation++;
   conversation = row.id;
   startStream();
@@ -914,6 +993,7 @@ async function openConversation(row) {
  * 打开登录对话框，并保留用户已经输入、准备在登录后发送的消息。
  */
 function openLogin() {
+  closeExecutionDetail();
   notice("", "login-error");
   if (!$("login-panel").open) $("login-panel").showModal();
 }
