@@ -69,10 +69,12 @@ Migration **`0007_agent_steps`**, following `0006_approved_resolutions`, adds:
 - `executions.revalidated_at` and `invalidation_reason`, separate from the original
   planning evidence.
 
-The merged schema head is **`0008_merge_agent_events`**. It joins the unchanged
+Revision **`0008_merge_agent_events`** joins the unchanged
 `0007_agent_steps` and `0007_conversation_events` revisions, both based on `0006`.
 `alembic upgrade head` works from either branch and preserves existing checkpoints
 and event records; no applied revision was renamed or rewritten.
+The current head is **`0009_conversation_management`**, which adds the pin and
+removal fields described in [Chat management](CHAT_MANAGEMENT.md).
 
 Apply migrations before starting the new API/worker images. Keep API and workers
 on the same release; old workers do not understand pending agent checkpoints.
