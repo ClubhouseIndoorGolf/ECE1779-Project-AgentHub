@@ -345,13 +345,23 @@ check_existing() {
     # 将现有服务定义与本次部署要求的存储及密钥配置进行比对。
     spec_data=$(docker service inspect --format '{{json .Spec}}' "$service") || fail 'Cannot inspect existing service'
     printf '%s' "$spec_data" | python3 -c '
-import json,os,sys
+import json,os,re,sys
 from pathlib import PurePosixPath
 # Use a common diagnostic for settings that require an explicit migration decision.
 # 对需要单独评估迁移的配置差异，使用统一的诊断信息。
 def require(condition):
     if not condition:
         sys.exit("Existing database settings or stack ownership differ; separate review required")
+
+# Normalize only digest-pinned references to the official Docker Hub postgres repository.
+# 仅规范化通过摘要固定的 Docker Hub 官方 postgres 仓库引用。
+def normalize_postgres_image(image):
+    match = re.fullmatch(
+        r"(?:(?:index\.)?docker\.io/)?(?:library/)?postgres"
+        r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@(sha256:[0-9a-f]{64})", image
+    )
+    return "docker.io/library/postgres@" + match[1] if match else image
+
 s=json.load(sys.stdin); name=s["Name"]; target=os.environ["STACK"]+"_db"
 # Check the published port and reject any other service that uses the same TCP port.
 # 检查发布端口，拒绝其他使用相同 TCP 端口的服务。
@@ -373,7 +383,7 @@ if name==target:
     c=s["TaskTemplate"]["ContainerSpec"]
     env=dict(v.split("=",1) for v in c.get("Env",[]))
     require(s.get("Labels",{}).get("com.docker.stack.namespace")==os.environ["STACK"])
-    require(c["Image"]==os.environ["POSTGRES_IMAGE"])
+    require(normalize_postgres_image(c["Image"]) == normalize_postgres_image(os.environ["POSTGRES_IMAGE"]))
     require(env.get("POSTGRES_DB")==os.environ["POSTGRES_DB"] and env.get("POSTGRES_USER")==os.environ["POSTGRES_USER"])
     require(any(m["Type"]=="bind" and m["Source"]==str(path) and m["Target"]=="/var/lib/postgresql/data" for m in mounts))
     require([x["SecretName"] for x in c.get("Secrets",[])]==[os.environ["DB_PASSWORD_SECRET"]])

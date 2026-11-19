@@ -127,7 +127,7 @@ def fake_docker(args):
             output = json.dumps({
                 "Name": stack + "_db", "Labels": {"com.docker.stack.namespace": stack},
                 "TaskTemplate": {"ContainerSpec": {
-                    "Image": "postgres:16" if fault == "changed-database" else os.environ["POSTGRES_IMAGE"],
+                    "Image": "postgres:16" if fault == "changed-database" else state.get("db_image", os.environ["POSTGRES_IMAGE"]),
                     "Env": ["POSTGRES_DB=" + os.environ["POSTGRES_DB"], "POSTGRES_USER=" + os.environ["POSTGRES_USER"]],
                     "Mounts": [{"Type": "bind", "Source": os.environ["POSTGRES_DATA_PATH"], "Target": "/var/lib/postgresql/data"}],
                     "Secrets": [{"SecretName": os.environ["DB_PASSWORD_SECRET"]}],
@@ -635,6 +635,31 @@ wait_healthy "${STACK}_worker" 2
         self.assertEqual(calls.count(["manifest", "inspect"]), 2)
         self.assertEqual(calls.count(["image", "inspect"]), 2)
         self.assertEqual(self.mutations(), [])
+
+    def test_existing_postgres_image_comparison(self):
+        self.two_nodes()
+        digest = "@sha256:837bed18782820fe967067cb5328b02b0d9992c1be9a37ee0c9c492cfc03af3b"
+        self.env["POSTGRES_IMAGE"] = "docker.io/library/postgres" + digest
+        for service_image, equivalent in (
+            ("postgres" + digest, True),
+            ("library/postgres" + digest, True),
+            ("docker.io/postgres" + digest, True),
+            ("index.docker.io/library/postgres:17" + digest, True),
+            ("postgres" + digest[:-1] + "a", False),
+            ("postgres:17", False),
+            ("docker.io/team/postgres" + digest, False),
+            ("registry.example/library/postgres" + digest, False),
+            ("docker.io/library/redis" + digest, False),
+        ):
+            with self.subTest(service_image=service_image):
+                self.state_path.write_text(json.dumps({"calls": [], "db_image": service_image}))
+                result = self.run_script(script="preflight.sh", mode="--check", fault="existing-database")
+                if equivalent:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("Existing database settings", result.stderr)
+                self.assertEqual(self.mutations(), [])
 
     def test_volume_registry_and_remote_identity_fail_closed(self):
         self.two_nodes()
