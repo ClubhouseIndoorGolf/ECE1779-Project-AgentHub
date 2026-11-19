@@ -478,11 +478,12 @@ def test_english_title_migration_preserves_existing_rows(client):
     command.downgrade(cfg, "0001_initial")
     with SessionLocal.begin() as session:
         owner = session.scalar(select(User).where(User.username == "alice"))
-        legacy = Conversation(user_id=owner.id)
-        session.add(legacy)
-        session.flush()
-        legacy_id = legacy.id
-        assert legacy.title == "新对话"
+        legacy_id = uuid4()
+        legacy_title = session.scalar(
+            text("INSERT INTO conversations (id, user_id) VALUES (:id, :owner) RETURNING title"),
+            {"id": legacy_id, "owner": owner.id},
+        )
+        assert legacy_title == "新对话"
     command.upgrade(cfg, "head")
     with SessionLocal.begin() as session:
         assert session.get(Conversation, original["id"]).title == "团队讨论"

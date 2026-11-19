@@ -77,6 +77,10 @@ class Conversation(Base):
     # User title or the English default for new conversations.
     # 用户设置的标题，或新会话的英文默认标题。
     title: Mapped[str] = mapped_column(Text, server_default=text("'New conversation'"))
+    # Chat management never removes the business audit trail.
+    # 会话管理不删除业务审计记录。
+    is_pinned: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Next sequence number, allocated while holding the conversation lock.
     # 下一个顺序号，在持有会话锁时分配。
     next_message_seq: Mapped[int] = mapped_column(BigInteger, server_default=text("1"))

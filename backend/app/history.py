@@ -6,10 +6,11 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.activity import read_activity
 from app.event_store import read_event_head
 from app.models import Execution, Job, Message, ProposalDecision, ResolutionProposal
 from app.resolution_workflow import PROPOSAL_VERSION
-from app.schemas import MessageOut, ProposalOut
+from app.schemas import ActivityOut, MessageOut, ProposalOut
 
 
 def _history_query(conversation_id: UUID):
@@ -58,10 +59,13 @@ def read_history(session: Session, conversation_id: UUID, after_seq: int, limit:
     """
     rows = session.execute(
         _history_query(conversation_id).where(Message.seq > after_seq).order_by(Message.seq).limit(limit)
-    )
+    ).all()
+    activity = read_activity(session, [message.id for message, *_ in rows if message.role == "user"])
     history = []
     for message, execution, proposal, decision, job in rows:
         result = MessageOut.model_validate(message)
+        if message.id in activity:
+            result.activity = ActivityOut.model_validate(activity[message.id])
         # Keep ordinary history in its original shape and attach proposals only when present.
         # 普通消息保持原有结构，仅在存在方案时附带方案字段。
         if proposal is not None:

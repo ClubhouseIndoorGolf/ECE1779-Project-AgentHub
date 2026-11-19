@@ -15,6 +15,7 @@ from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session, aliased
 
+from app.activity import step_event
 from app.agent import actor, check_deadline, run_agent
 from app.agent_contract import TERMINAL, Decision
 from app.config import positive_number
@@ -374,6 +375,8 @@ def complete_job(
             else:
                 message = append_final_reply(session, conversation, source.id, outcome)
                 events = [message_created_event(message)]
+        if step is not None:
+            events.extend(step_event(job, step))
         transition_owned_job(
             session,
             claim,

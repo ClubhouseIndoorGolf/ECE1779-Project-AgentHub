@@ -19,6 +19,7 @@ The browser receives conversation changes over a Server-Sent Events (SSE) stream
 | `message` | Message `seq` | The same object as one row of `GET /conversations/{id}/messages`, including any `proposal`. |
 | `job` | None | Public job fields (`id`, `source_message_id`, `kind`, `status`, `attempts`, `last_error`, `created_at`, `finished_at`). Sent when a job's status or attempt count changes. Lease fields are never included. |
 | `proposal` | None | The public proposal object. Sent when a proposal appears or its status or decision changes. |
+| `activity` | None | Source message ID, initial job ID/status/attempts and safe tool-step labels. Sent when the saved activity snapshot changes. |
 | `error` | None | `{"detail": "Database temporarily unavailable"}`. The stream then closes, and the client reconnects with backoff. |
 
 Each connection tracks the state it has already sent, so it sends a job or proposal only when it changes. A reconnect resends current active jobs, so listeners should treat events as idempotent.
@@ -31,7 +32,7 @@ Each connection tracks the state it has already sent, so it sends a job or propo
 
 The version 2 endpoint returns `422` before streaming if the cursor is missing, malformed, a legacy numeric cursor, or ahead of the conversation's committed event head. Reload the history snapshot to obtain a valid cursor. Both versions check the same account ownership and use short database sessions.
 
-Each stored frame uses an event name such as `proposal.decided` and an ID such as `v2:42`. Its JSON contains `seq` (a decimal string), `type`, `conversation_id`, `created_at`, and the original `payload`. Supported types are `message.created`, `proposal.created`, `proposal.decided`, `job.status_changed`, `resolution.completed`, and `resolution.invalidated`. The connection confirmation, heartbeat, and error frames leave the cursor unchanged. Existing history remains available through the message endpoint. Durable replay covers events recorded after the migration and the installation of the event writers.
+Each stored frame uses an event name such as `proposal.decided` and an ID such as `v2:42`. Its JSON contains `seq` (a decimal string), `type`, `conversation_id`, `created_at`, and the original `payload`. Supported types are `message.created`, `proposal.created`, `proposal.decided`, `job.status_changed`, `resolution.completed`, `resolution.invalidated`, `agent.step_started`, and `agent.step_completed`. Agent events contain `job_id`, `source_message_id`, and a `step` with `seq`, `name`, `status`, and a fixed public `text` label. The connection confirmation, heartbeat, and error frames leave the cursor unchanged. Existing history remains available through the message endpoint. Durable replay covers events recorded after the migration and the installation of the event writers.
 
 ## Browser client
 
@@ -40,7 +41,8 @@ The browser reads the default stream with authenticated `fetch` and a body reade
 - **Starting and stopping.** Opening or creating a conversation starts its stream. Starting a new chat or signing out closes it.
 - **Reconnection.** After a normal close, the client reconnects within 250 ms. After a failure, it backs off from 1 s to at most 15 s with jitter. A stream with no data for 45 seconds is treated as dropped. A `401` or `404` stops the stream without retrying.
 - **Reauthentication.** A `401` from the event stream or a history refresh it triggered stops live updates, cancels scheduled refresh retries, and opens the sign-in dialog. The client compares the user ID returned by `GET /me` with the previous user's ID. The same account keeps its open conversation and draft and reconnects. A different account starts with an empty chat and loads its own conversation list. The previous account's messages, drafts, and pending submission state are cleared, and late responses from its workspace are ignored.
-- **Using events.** `job` events complete message sends and approved refund continuations immediately. `message`, `proposal` and `ready` events trigger one debounced history refresh, which reuses the existing stale-response guards.
+- **Using events.** `job` events complete message sends and approved refund continuations immediately. Job, message, proposal, activity and ready events trigger one debounced history refresh, which reuses the existing stale-response guards. Activity is rendered once per request from the saved snapshot, rather than appended blindly from events. Polling during a send also refreshes activity when SSE is unavailable.
+- **Activity timeline.** Muted lines show tool progress, eligibility outcomes, retries, approval waiting and the final resolution state. Unfinished steps are never marked completed on failure. Ordinary chat has a working indicator but no invented tool steps. The final assistant answer stays separate. Reopening a conversation reconstructs the timeline from saved steps; a short tool call may finish between stream polls.
 - **Fallback.** While no stream is live, or where the browser lacks body streams, the client polls `/jobs/{id}` as before. When a stream is live, it confirms a job over REST if no event arrives within 5 seconds.
 - **Status.** The footer shows **Live updates** (green), **Reconnecting…** (amber) or **Local workspace**.
 

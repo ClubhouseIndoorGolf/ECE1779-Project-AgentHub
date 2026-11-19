@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # Reject unknown input fields and provide the English default title.
@@ -26,10 +26,25 @@ class ConversationCreate(BaseModel):
 
 # Expose conversation metadata without internal sequence-allocation fields.
 # 返回会话资料，不公开内部顺序号分配字段。
+class ConversationUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    is_pinned: bool | None = Field(default=None, strict=True)
+
+    @model_validator(mode="after")
+    def validate_update(self):
+        if not self.model_fields_set or any(getattr(self, key) is None for key in self.model_fields_set):
+            raise ValueError("Provide a title or pin state; null values are not supported")
+        if self.title is not None:
+            self.title = ConversationCreate.check_title(self.title)
+        return self
+
+
 class ConversationOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
     title: str
+    is_pinned: bool
     created_at: datetime
     updated_at: datetime
 
@@ -98,6 +113,20 @@ class ProposalDecisionOut(BaseModel):
 
 # Return saved chat text and its relationship to the originating request.
 # 返回已保存的聊天文本，以及与原始请求的关联。
+class ActivityStepOut(BaseModel):
+    seq: int
+    name: str
+    status: Literal["running", "completed"]
+    text: str
+
+
+class ActivityOut(BaseModel):
+    job_id: UUID
+    status: Literal["QUEUED", "RUNNING", "SUCCEEDED", "FAILED"]
+    attempts: int
+    steps: list[ActivityStepOut]
+
+
 class MessageOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
@@ -108,6 +137,7 @@ class MessageOut(BaseModel):
     reply_to_message_id: UUID | None
     created_at: datetime
     proposal: ProposalOut | None = None
+    activity: ActivityOut | None = None
 
 
 # Return stable identifiers for both a new submission and its retries.

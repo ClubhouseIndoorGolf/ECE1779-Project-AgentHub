@@ -21,10 +21,11 @@ def test_upgrade_from_either_branch_preserves_records(accounts, revision):
     command.downgrade(cfg, "0006_approved_resolutions")
     command.upgrade(cfg, revision)
     with SessionLocal.begin() as session:
-        conversation = Conversation(user_id=accounts[0])
-        session.add(conversation)
-        session.flush()
-        cid = conversation.id
+        cid = uuid4()
+        session.execute(
+            text("INSERT INTO conversations (id, user_id) VALUES (:id, :owner)"),
+            {"id": cid, "owner": accounts[0]},
+        )
         if revision == "0007_agent_steps":
             source = Message(conversation_id=cid, seq=1, role="user", content="Hello", submission_key=uuid4())
             session.add(source)
@@ -40,9 +41,11 @@ def test_upgrade_from_either_branch_preserves_records(accounts, revision):
     command.upgrade(cfg, "head")
     with SessionLocal() as session:
         assert session.scalars(text("SELECT version_num FROM alembic_version")).all() == [
-            "0008_merge_agent_events"
+            "0009_conversation_management"
         ]
         assert session.get(Conversation, cid) is not None
+        assert session.get(Conversation, cid).is_pinned is False
+        assert session.get(Conversation, cid).deleted_at is None
         if revision == "0007_agent_steps":
             assert session.get(AgentStep, (jid, 1)).arguments == {"text": "Saved answer"}
             assert session.get(Job, jid).model_calls == 1

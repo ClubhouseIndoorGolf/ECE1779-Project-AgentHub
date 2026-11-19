@@ -91,8 +91,11 @@ steps; their status/history endpoints remain authoritative.
 
 PR #6's SSE transport is integrated on this branch. REST and SSE share the proposal
 serializer in `history.py`, including revalidation time and invalidation reason.
-The stream currently carries message, job and proposal updates; individual tool
-steps remain available through the authenticated REST endpoint above.
+The stream carries message, job, proposal and activity updates. History attaches
+an `activity` snapshot to each user message: job ID, status, attempt count and
+public tool steps. The chat renders these as a muted timeline below the request.
+Labels describe executed tools and saved outcomes, not model reasoning. Arguments,
+drafts and raw tool responses are not included in the public activity snapshot.
 
 PR #7's durable replay is also integrated. Agent-generated proposals, terminal
 replies, job transitions and approved resolutions append events in their business
@@ -103,9 +106,14 @@ invalidation events retain the existing broad `reason` and additionally expose
 Clients opt into `version=2` using the history snapshot's `v2:` cursor; the existing
 browser continues to use the compatible default stream. See [Live updates](LIVE_UPDATES.md).
 
-The SSE owner can later publish each completed row once using `(job_id, seq)` as the
-stable identity, replay after the cursor, and use existing job/history state for
-terminal status. This branch adds no competing SSE transport or UI event model.
+Tool checkpoints now append `agent.step_started` and `agent.step_completed` in the
+same transaction, under the final lease/deadline checks. `(job_id, step.seq)` is
+the stable step identity. The default stream emits changed `activity` snapshots;
+the browser refreshes authoritative history, so reconnects and reopening a chat
+restore completed and pending steps without adding duplicate lines. Fast tools
+may appear already completed on the next poll; no artificial delay is added.
+The v2 stream replays individual saved transitions. Existing steps are shown in
+history but are not backfilled into the event log. No schema migration is needed.
 Step completion is durable progress, not proof of an applied refund. The proposal
 and continuation status provide the business outcome.
 
@@ -149,5 +157,5 @@ later turn. They do not simulate loss of the PostgreSQL server itself.
 
 See [evaluation instructions and evidence](evaluation/README.md). Deterministic
 execution and synthetic scaling results must be reported separately from live
-model tool selection and draft quality. Cloud deployment, live model acceptance,
-tool-step SSE/UI integration and team schema review remain integration work.
+model tool selection and draft quality. Cloud deployment, full live model acceptance
+and team schema review remain integration work.

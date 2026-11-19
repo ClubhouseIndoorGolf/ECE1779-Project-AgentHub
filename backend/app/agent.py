@@ -8,8 +8,10 @@ from datetime import timedelta
 
 from sqlalchemy import func, select
 
+from app.activity import step_event
 from app.agent_contract import TERMINAL, Decision
 from app.db import SessionLocal
+from app.event_store import append_events
 from app.leases import LostLease, fence_checkpoint, owned_job
 from app.models import AgentStep, AppliedResolution, Conversation, Job, Message, Order, User
 from app.refund_eligibility import RefundEligibility, evaluate_refund_eligibility
@@ -98,6 +100,8 @@ def run_agent(claim, provider, messages, settings):
                     return pending.seq
                 pending.result = read_tool(session, job, decision)
                 pending.finished_at = func.clock_timestamp()
+                source = session.get(Message, job.source_message_id)
+                append_events(session, source.conversation_id, step_event(job, pending))
                 check_deadline(session, job)
                 fence_checkpoint(session, claim)
                 check_deadline(session, job)
@@ -124,7 +128,10 @@ def run_agent(claim, provider, messages, settings):
                 if job.tool_calls >= settings.agent_tool_calls:
                     raise AgentBudgetExceeded("Tool call budget reached")
                 job.tool_calls += 1
-            session.add(AgentStep(job_id=job.id, seq=seq, name=decision.name, arguments=decision.arguments))
+            step = AgentStep(job_id=job.id, seq=seq, name=decision.name, arguments=decision.arguments)
+            session.add(step)
+            source = session.get(Message, job.source_message_id)
+            append_events(session, source.conversation_id, step_event(job, step))
             fence_checkpoint(session, claim)
             check_deadline(session, job)
         log.info("job=%s step=%s action=%s checkpoint=ready", claim.job_id, seq, decision.name)

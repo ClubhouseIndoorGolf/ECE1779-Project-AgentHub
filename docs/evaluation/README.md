@@ -129,3 +129,20 @@ snapshot cursor, five ordered message/job events and an exact reconnect replay
 after `v2:3`. This was local container verification; no paid model calls, cloud
 deployment or new scaling benchmark was performed. The existing upstream
 TestClient deprecation warning remains non-failing.
+
+## Agent activity timeline
+
+Local changes based on `f8d0ddf` add public tool start/completion events, history
+snapshots and the chat activity timeline. Verification on the changed working tree:
+**182 backend tests passed**, **23 offline browser-state tests passed**, Ruff lint
+and formatting passed (45 files), and the runtime image built successfully.
+The new tests cover pending/completed snapshots, v2 replay, authorization,
+checkpoint/event rollback on expiry, retry deduplication, safe text rendering,
+failure labels and restoration after reopening. Existing process-kill recovery
+tests also passed. The FastAPI/Starlette deprecation warning remains non-failing.
+
+The local API and worker were recreated successfully. An authenticated read-only
+HTTP check confirmed healthy OpenAI mode, the new static assets and all three
+saved tool steps from the earlier live refund-proposal check. This verification
+did not call the live model again or exercise a cloud deployment. The browser-state
+suite is an offline DOM harness, not a full browser visual test.

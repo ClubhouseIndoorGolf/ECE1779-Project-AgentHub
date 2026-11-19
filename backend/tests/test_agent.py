@@ -141,6 +141,10 @@ def test_retry_reuses_checkpoint_and_does_not_reset_call_budget(client, demo_tic
         assert job.model_calls == 3 and job.tool_calls == 1
         assert job.agent_deadline_at == deadline
         assert len(session.scalars(select(AgentStep)).all()) == 2
+        events = session.scalars(
+            select(ConversationEvent).where(ConversationEvent.event_type.like("agent.%"))
+        ).all()
+        assert [event.event_type for event in events].count("agent.step_completed") == 1
 
 
 @pytest.mark.parametrize("limit", ["model", "tool", "deadline"])

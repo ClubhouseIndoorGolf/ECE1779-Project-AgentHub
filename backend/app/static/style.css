@@ -59,6 +59,23 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 .conversation-list button { width: 100%; border: 0; background: none; text-align: left; border-radius: 7px; padding: 10px 11px; font-size: 12px; line-height: 1.4; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; display: block; margin-bottom: 2px; color: var(--secondary); }
 .conversation-list button:hover { background: var(--hover); color: var(--text); }
 .conversation-list button[aria-current=true] { background: var(--selected); color: var(--text); }
+.conversation-row { display: flex; align-items: center; gap: 2px; }
+.conversation-row .conversation-open { flex: 1; min-width: 0; }
+.conversation-row .conversation-more { width: 30px; flex: 0 0 30px; padding: 8px 4px; text-align: center; font-size: 18px; }
+.chat-menu { position: fixed; z-index: 20; width: 168px; padding: 5px; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 8px 25px #0002; }
+.chat-menu button { display: block; width: 100%; border: 0; background: transparent; color: var(--text); text-align: left; padding: 10px 12px; border-radius: 6px; font: inherit; font-size: 13px; }
+.chat-menu button:hover, .chat-menu button:focus-visible { background: var(--hover); outline: 2px solid var(--border); }
+.chat-menu .danger-action { color: #bf4040; }
+.chat-action-dialog { width: 400px; max-width: calc(100% - 32px); border: 1px solid var(--border); border-radius: 16px; padding: 24px; background: var(--bg); color: var(--text); }
+.chat-action-dialog::backdrop { background: #0006; }
+.chat-action-dialog h2 { font-size: 19px; margin: 0 0 12px; }
+.chat-action-dialog p { font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.chat-action-dialog label { display: block; margin-bottom: 8px; font-size: 12px; }
+.chat-action-dialog input { width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--input); color: var(--text); font: inherit; }
+.chat-action-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+.chat-action-buttons button { width: auto; margin: 0; padding: 9px 16px; border: 1px solid var(--border); border-radius: 7px; font: inherit; font-size: 13px; }
+#chat-action-cancel { background: var(--input); color: var(--text); }
+.chat-action-buttons .delete-confirm { background: #b33333; color: white; }
 .history-empty { font-size: 12px; line-height: 1.8; color: var(--muted); padding: 3px 10px; max-width: 200px; }
 .search-input { margin: 6px 3px 0; width: calc(100% - 6px); border: 1px solid var(--border); border-radius: 7px; padding: 9px; background: var(--bg); color: var(--text); font-size: 12px; outline: none; }
 .search-input:focus { border-color: var(--muted); }
@@ -155,6 +172,13 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 .proposal-reject { background: var(--input); color: var(--text); }
 .proposal-actions button:disabled { opacity: .6; cursor: default; }
 .pending-message { display: flex; align-items: center; gap: 9px; font-size: 12px; color: var(--muted); padding: 4px 0 24px; }
+/* Persisted activity is visually secondary to the final response.
+   持久化进度在视觉上弱于最终答复。 */
+.execution-activity { color: var(--muted); font-size: 12px; line-height: 1.7; margin: -8px 0 22px; }
+.execution-activity ol { list-style: none; padding: 0 0 0 12px; margin: 0; border-left: 1px solid var(--border); }
+.execution-activity li { display: flex; gap: 8px; padding: 3px 0; overflow-wrap: anywhere; }
+.activity-mark { display: inline-block; flex: 0 0 14px; text-align: center; }
+.activity-running .activity-mark { animation: spin 1.5s linear infinite; }
 .notice { font-size: 12px; color: var(--error); line-height: 1.6; margin: 12px 2px; white-space: pre-wrap; }
 /* Footer and collapsed navigation keep their controls reachable when the sidebar is hidden.
    底部状态与折叠导航配合，确保隐藏侧栏后仍可重新打开导航。

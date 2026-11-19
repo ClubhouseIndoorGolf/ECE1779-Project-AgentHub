@@ -55,6 +55,7 @@ from app.schemas import (
     AgentStepOut,
     ConversationCreate,
     ConversationOut,
+    ConversationUpdate,
     JobOut,
     MessageCreate,
     MessageOut,
@@ -143,7 +144,7 @@ def create_conversation(
 @app.get(
     "/conversations",
     response_model=list[ConversationOut],
-    description="List your conversations, most recently updated first.",
+    description="List your conversations, pinned first, then most recently updated.",
 )
 def list_conversations(
     limit: int = Query(100, ge=1, le=500),
@@ -155,10 +156,78 @@ def list_conversations(
     """
     return session.scalars(
         select(Conversation)
-        .where(Conversation.user_id == user.id)
-        .order_by(Conversation.updated_at.desc(), Conversation.id)
+        .where(Conversation.user_id == user.id, Conversation.deleted_at.is_(None))
+        .order_by(Conversation.is_pinned.desc(), Conversation.updated_at.desc(), Conversation.id)
         .limit(limit)
     ).all()
+
+
+@app.patch("/conversations/{conversation_id}", response_model=ConversationOut)
+def update_conversation(
+    conversation_id: UUID,
+    payload: ConversationUpdate,
+    user: User = Depends(current_user),
+    session: Session = Depends(get_session),
+):
+    """Apply explicit title/pin values under the same lock as message submissions.
+    与消息提交使用相同的锁，写入明确指定的标题或置顶值。
+    """
+    with session.begin():
+        conversation = session.scalar(
+            select(Conversation)
+            .where(
+                Conversation.id == conversation_id,
+                Conversation.user_id == user.id,
+                Conversation.deleted_at.is_(None),
+            )
+            .with_for_update()
+        )
+        if conversation is None:
+            raise HTTPException(404, "Conversation not found")
+        for key, value in payload.model_dump(exclude_unset=True).items():
+            setattr(conversation, key, value)
+        conversation.updated_at = func.clock_timestamp()
+    return conversation
+
+
+@app.delete("/conversations/{conversation_id}", status_code=204)
+def delete_conversation(
+    conversation_id: UUID,
+    user: User = Depends(current_user),
+    session: Session = Depends(get_session),
+):
+    """Hide settled chats without deleting refunds or leaving hidden work running.
+    隐藏已结束的聊天，保留退款记录且不留下隐藏的运行任务。
+    """
+    with session.begin():
+        conversation = session.scalar(
+            select(Conversation)
+            .where(
+                Conversation.id == conversation_id,
+                Conversation.user_id == user.id,
+            )
+            .with_for_update()
+        )
+        if conversation is None:
+            raise HTTPException(404, "Conversation not found")
+        if conversation.deleted_at is not None:
+            return Response(status_code=204)
+        active_job = session.scalar(
+            select(Job.id)
+            .join(Message, Job.source_message_id == Message.id)
+            .where(
+                Message.conversation_id == conversation_id,
+                Job.status.in_(("QUEUED", "RUNNING")),
+            )
+            .limit(1)
+        )
+        if active_job or active_resolution_exists(session, conversation_id):
+            raise HTTPException(
+                409, "Finish active work or reject the pending proposal before deleting this chat."
+            )
+        conversation.deleted_at = func.clock_timestamp()
+        conversation.is_pinned = False
+    return Response(status_code=204)
 
 
 # Lock one conversation and atomically save its message, sequence and job.
@@ -183,7 +252,11 @@ def submit_message(
         # 检查会话归属并锁定会话，与 Worker 保存回复时共同保护消息顺序号的分配。
         conversation = session.scalar(
             select(Conversation)
-            .where(Conversation.id == conversation_id, Conversation.user_id == user.id)
+            .where(
+                Conversation.id == conversation_id,
+                Conversation.user_id == user.id,
+                Conversation.deleted_at.is_(None),
+            )
             .with_for_update()
         )
         if not conversation:
@@ -267,7 +340,11 @@ def list_messages(
         # 在请求会话的第一条 SQL 执行前设置隔离级别。
         session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
     conversation = session.scalar(
-        select(Conversation).where(Conversation.id == conversation_id, Conversation.user_id == user.id)
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == user.id,
+            Conversation.deleted_at.is_(None),
+        )
     )
     if not conversation:
         raise HTTPException(404, "Conversation not found")
@@ -312,7 +389,9 @@ async def stream_events(
         with SessionLocal() as session:
             owned = session.scalar(
                 select(Conversation.id).where(
-                    Conversation.id == conversation_id, Conversation.user_id == user.id
+                    Conversation.id == conversation_id,
+                    Conversation.user_id == user.id,
+                    Conversation.deleted_at.is_(None),
                 )
             )
             if owned is None:
@@ -360,7 +439,11 @@ def decide_proposal(
             .join(Message, Message.conversation_id == Conversation.id)
             .join(Execution, Execution.source_message_id == Message.id)
             .join(ResolutionProposal, ResolutionProposal.execution_id == Execution.id)
-            .where(ResolutionProposal.id == proposal_id, Conversation.user_id == user.id)
+            .where(
+                ResolutionProposal.id == proposal_id,
+                Conversation.user_id == user.id,
+                Conversation.deleted_at.is_(None),
+            )
             .with_for_update(of=Conversation)
         ).one_or_none()
         if row is None:
@@ -451,7 +534,7 @@ def get_job(job_id: UUID, user: User = Depends(current_user), session: Session =
         select(Job)
         .join(Message, Job.source_message_id == Message.id)
         .join(Conversation, Message.conversation_id == Conversation.id)
-        .where(Job.id == job_id, Conversation.user_id == user.id)
+        .where(Job.id == job_id, Conversation.user_id == user.id, Conversation.deleted_at.is_(None))
     )
     if not job:
         raise HTTPException(404, "Job not found")
