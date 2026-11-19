@@ -11,6 +11,7 @@ from app.event_store import EventToAppend, append_events, message_created_event
 from app.models import (
     AppliedResolution,
     Conversation,
+    ConversationEvent,
     Execution,
     Job,
     Message,
@@ -79,6 +80,22 @@ def invalidate_proposal(
         ),
         message_created_event(message),
     ]
+
+
+def read_invalidation_reason(session: Session, conversation_id: UUID, proposal_id: UUID) -> str | None:
+    """Read the saved reason for a proposal in an already authorized conversation.
+    读取已通过归属校验的会话中该方案的失效原因。
+    """
+    return session.scalar(
+        select(ConversationEvent.payload["reason"].astext)
+        .where(
+            ConversationEvent.conversation_id == conversation_id,
+            ConversationEvent.event_type == "resolution.invalidated",
+            ConversationEvent.payload["proposal_id"].astext == str(proposal_id),
+        )
+        .order_by(ConversationEvent.seq.desc())
+        .limit(1)
+    )
 
 
 def active_resolution_exists(session: Session, conversation_id: UUID) -> bool:

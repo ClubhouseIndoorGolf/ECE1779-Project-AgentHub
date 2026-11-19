@@ -88,6 +88,11 @@ def execution_path(client, history_path):
     return f"/executions/{client.get(history_path).json()[0]['execution_id']}"
 
 
+def assert_conflict(response, code, detail):
+    assert response.status_code == 409
+    assert response.json() == {"code": code, "detail": detail}
+
+
 def test_approved_resolution_preserves_receipts_and_applies_exact_draft(client, demo_tickets):
     """Keep both retry receipts stable and persist exactly the approved business action.
     保持两种重试回执稳定，并按获批内容精确保存业务动作。
@@ -101,9 +106,20 @@ def test_approved_resolution_preserves_receipts_and_applies_exact_draft(client, 
     assert pending["status"] == "WAITING_FOR_APPROVAL"
     assert pending["decision"] is pending["resume_job_status"] is pending["result"] is None
     assert decide(client, proposal, auth=("bob", "bob-test-password")).status_code == 404
-    assert decide(client, {**proposal, "version": 2}).status_code == 409
-    blocked = client.post(path, json={"content": "Approve it", "submission_key": str(uuid4())})
-    assert blocked.status_code == 409
+    assert_conflict(
+        decide(client, {**proposal, "version": 2}),
+        "PROPOSAL_VERSION_CONFLICT",
+        "Proposal version has changed",
+    )
+    new_message = {"content": "A new turn", "submission_key": str(uuid4())}
+    blocked_detail = "Resolve the active refund proposal before sending a new message."
+    assert_conflict(client.post(path, json=new_message), "CONVERSATION_BUSY", blocked_detail)
+    assert client.post(path, json=payload).json() == initial
+    assert_conflict(
+        client.post(path, json={**payload, "content": new_message["content"]}),
+        "IDEMPOTENCY_CONFLICT",
+        "submission_key already used for different content",
+    )
 
     # Approval creates a different job while leaving the original message receipt intact.
     # 批准创建不同的恢复待办，同时保留原有消息回执。
@@ -111,7 +127,9 @@ def test_approved_resolution_preserves_receipts_and_applies_exact_draft(client, 
     assert response.status_code == 200
     decision = response.json()
     assert decision["resume_job_id"] != initial["job_id"]
-    assert client.post(path, json=payload).json() == initial
+    submission_retry = client.post(path, json=payload)
+    assert submission_retry.status_code == 202 and submission_retry.json() == initial
+    assert_conflict(client.post(path, json=new_message), "CONVERSATION_BUSY", blocked_detail)
     assert client.get(path).json()[0]["proposal"]["status"] == "QUEUED"
     queued = client.get(detail_path).json()
     assert queued["status"] == queued["resume_job_status"] == "QUEUED"
@@ -119,6 +137,7 @@ def test_approved_resolution_preserves_receipts_and_applies_exact_draft(client, 
     assert queued["result"] is None
     claim = claim_job("apply-worker")
     assert claim.kind == "RESUME_EXECUTION"
+    assert_conflict(client.post(path, json=new_message), "CONVERSATION_BUSY", blocked_detail)
     assert client.get(path).json()[0]["proposal"]["status"] == "RUNNING"
     running = client.get(detail_path).json()
     assert running["status"] == running["resume_job_status"] == "RUNNING"
@@ -130,8 +149,13 @@ def test_approved_resolution_preserves_receipts_and_applies_exact_draft(client, 
     assert messages[0]["proposal"]["decision"] == "APPROVE"
     assert messages[1]["reply_to_message_id"] == initial["message_id"]
     assert "CAD 129.99" in messages[1]["content"]
-    assert decide(client, proposal).json() == decision
-    assert decide(client, proposal, "REJECT").status_code == 409
+    decision_retry = decide(client, proposal)
+    assert decision_retry.status_code == 200 and decision_retry.json() == decision
+    assert_conflict(
+        decide(client, proposal, "REJECT"),
+        "DECISION_CONFLICT",
+        "A different decision has already been recorded",
+    )
     detail = client.get(detail_path).json()
     assert detail["status"] == "COMPLETED"
     assert detail["resume_job_status"] == "SUCCEEDED"
@@ -279,25 +303,30 @@ def test_concurrent_decisions_create_one_receipt(client, demo_tickets, second_de
         assert decisions[0]["resume_job_id"] == (str(saved.resume_job_id) if saved.resume_job_id else None)
 
 
-def test_approval_rolls_back_if_event_batch_cannot_be_saved(client, demo_tickets):
-    """Keep the proposal waiting when its approval and event batch cannot commit.
-    审批和事件批次无法提交时，让方案继续等待审批。
+@pytest.mark.parametrize("expired", [False, True], ids=["approval", "expiration"])
+def test_decision_rolls_back_if_event_batch_cannot_be_saved(client, demo_tickets, expired):
+    """Roll back approval or expiration when its event batch cannot commit.
+    事件批次无法提交时回滚批准或过期处理。
     """
     path, _, _, proposal = plan(client)
     conversation_id = UUID(path.split("/")[2])
+    if expired:
+        expire_proposal(proposal)
     with SessionLocal() as session:
         before = read_event_head(session, conversation_id)
 
     def fail_event_insert(_conn, _cursor, statement, _parameters, _context, _executemany):
-        """Fail after the decision and queued job flush, but before event insertion.
-        在决定与排队待办写入事务之后、事件插入之前注入失败。
+        """Fail at the event insert after the business writes are flushed.
+        业务变更写入事务后，在插入事件时注入失败。
         """
         if statement.startswith("INSERT INTO conversation_events"):
             raise SQLAlchemyError("simulated event write failure")
 
     event.listen(engine, "before_cursor_execute", fail_event_insert)
     try:
-        assert decide(client, proposal).status_code == 503
+        failed = decide(client, proposal)
+        assert failed.status_code == 503
+        assert failed.json() == {"detail": "Database temporarily unavailable"}
     finally:
         event.remove(engine, "before_cursor_execute", fail_event_insert)
     with SessionLocal() as session:
@@ -305,24 +334,41 @@ def test_approval_rolls_back_if_event_batch_cannot_be_saved(client, demo_tickets
         assert read_events(session, conversation_id, after_seq=before) == []
         assert session.scalars(select(ProposalDecision)).first() is None
         assert session.scalars(select(Job).where(Job.kind == "RESUME_EXECUTION")).first() is None
-    assert client.get(path).json()[0]["proposal"]["status"] == "WAITING_FOR_APPROVAL"
-    assert decide(client, proposal).status_code == 200
+    (source,) = client.get(path).json()
+    assert source["proposal"]["status"] == "WAITING_FOR_APPROVAL"
+    retry = decide(client, proposal)
     with SessionLocal() as session:
-        decision, job = read_events(session, conversation_id, after_seq=before)
-        assert decision.seq == before + 1 and decision.event_type == "proposal.decided"
-        assert job.payload["status"] == "QUEUED"
+        first, second = read_events(session, conversation_id, after_seq=before)
+    assert (first.seq, second.seq) == (before + 1, before + 2)
+    if expired:
+        assert_conflict(retry, "PROPOSAL_EXPIRED", "Proposal has expired")
+        assert (first.event_type, second.event_type) == ("resolution.invalidated", "message.created")
+        assert first.payload["reason"] == "EXPIRED"
+    else:
+        assert retry.status_code == 200
+        assert (first.event_type, second.event_type) == ("proposal.decided", "job.status_changed")
+        assert second.payload["status"] == "QUEUED"
 
 
-@pytest.mark.parametrize("change", ["expired_before_approval", "expired_after_approval", "changed_order"])
+@pytest.mark.parametrize(
+    "change", ["expired_before_approval", "expired_by_worker", "expired_after_approval", "changed_order"]
+)
 def test_expired_or_changed_proposal_never_writes_business_data(client, demo_tickets, change):
     """Invalidate stale input and retain any approval receipt that already exists.
     使过时方案失效，并保留此前已存在的批准回执。
     """
-    path, _, _, proposal = plan(client)
+    path, _, initial, proposal = plan(client)
+    conversation_id = UUID(path.split("/")[2])
     decision = resume_job_status = None
-    if change == "expired_before_approval":
+    if change in {"expired_before_approval", "expired_by_worker"}:
         expire_proposal(proposal)
-        assert decide(client, proposal).status_code == 409
+        if change == "expired_by_worker":
+            assert run_once("expiry-worker")
+        else:
+            assert_conflict(decide(client, proposal), "PROPOSAL_EXPIRED", "Proposal has expired")
+        assert_conflict(
+            decide(client, proposal), "PROPOSAL_EXPIRED", "Proposal is no longer waiting for approval"
+        )
     else:
         response = decide(client, proposal)
         assert response.status_code == 200
@@ -334,8 +380,10 @@ def test_expired_or_changed_proposal_never_writes_business_data(client, demo_tic
             with SessionLocal.begin() as session:
                 session.get(Order, 1001).paid_total_minor = 13000
         assert run_once("apply-worker")
-        assert decide(client, proposal).json() == response.json()
-    source = client.get(path).json()[0]
+        retry = decide(client, proposal)
+        assert retry.status_code == 200 and retry.json() == decision
+    source, reply = client.get(path).json()
+    assert reply["reply_to_message_id"] == initial["message_id"]
     assert source["proposal"]["status"] == "INVALIDATED"
     detail = client.get(f"/executions/{source['execution_id']}").json()
     assert detail["status"] == "INVALIDATED"
@@ -345,13 +393,35 @@ def test_expired_or_changed_proposal_never_writes_business_data(client, demo_tic
     with SessionLocal() as session:
         assert session.get(Ticket, 391).status == "OPEN"
         assert session.scalars(select(AppliedResolution)).first() is None
-        rows = read_events(session, UUID(source["conversation_id"]))
+        if decision is None:
+            assert session.get(ProposalDecision, UUID(proposal["id"])) is None
+            assert session.scalar(select(Job.id).where(Job.kind == "RESUME_EXECUTION")) is None
+        rows = read_events(session, conversation_id)
         outcomes = [row for row in rows if row.event_type.startswith("resolution.")]
         assert len(outcomes) == 1
         assert outcomes[0].event_type == "resolution.invalidated"
         assert outcomes[0].payload["reason"] == (
             "BUSINESS_STATE_CHANGED" if change == "changed_order" else "EXPIRED"
         )
+        assert any(
+            row.event_type == "message.created" and row.payload["message_id"] == reply["id"] for row in rows
+        )
+
+
+def test_legacy_invalidated_proposal_without_event_uses_not_pending_conflict(client, demo_tickets):
+    path, _, _, proposal = plan(client)
+    expire_proposal(proposal)
+    assert run_once("expiry-worker")
+
+    # Simulate a proposal closed before the durable event migration.
+    # 模拟持久化事件迁移前已关闭的方案。
+    cfg = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+    command.downgrade(cfg, "0006_approved_resolutions")
+    command.upgrade(cfg, "head")
+    assert len(client.get(path).json()) == 2
+    assert_conflict(
+        decide(client, proposal), "PROPOSAL_NOT_PENDING", "Proposal is no longer waiting for approval"
+    )
 
 
 @pytest.mark.parametrize("release", ["approve", "expire"])
@@ -407,12 +477,13 @@ def test_upgraded_pending_proposals_finalize_in_source_order(client, demo_ticket
 
     # Rejecting or expiring the later proposal must wait for the older continuation.
     # 拒绝或终止已过期的后续方案，都必须等待前序恢复待办。
-    assert decide(client, later, "REJECT").status_code == 409
+    busy_detail = "Resolve earlier turns in this conversation before deciding this proposal"
+    assert_conflict(decide(client, later, "REJECT"), "CONVERSATION_BUSY", busy_detail)
     if later_action == "expire":
         expire_proposal(later)
         assert not run_once("expiry-worker")
     assert decide(client, earlier).status_code == 200
-    assert decide(client, later, "REJECT").status_code == 409
+    assert_conflict(decide(client, later, "REJECT"), "CONVERSATION_BUSY", busy_detail)
     assert run_once("continuation-worker")
     if later_action == "expire":
         assert run_once("expiry-worker")
