@@ -147,47 +147,86 @@ probe_before_deadline() {
   timeout --signal=TERM --kill-after=1s "${remaining}s" "$@"
 }
 
-# Wait for the expected replicas to become healthy and the service update to leave the updating state.
-# 等待预期副本达到健康状态，并确认服务已退出更新中状态。
-wait_healthy() {
-  local service=$1 expected=$2 deadline=$((SECONDS + DEPLOY_TIMEOUT)) ids id record node container state count total health update quoted
-  while (( SECONDS < deadline )); do
-    # Check rollout state and list only the tasks Swarm currently wants running.
-    # 检查更新状态，并列出 Swarm 当前期望运行的任务。
-    update=$(probe_before_deadline "$deadline" docker service inspect --format '{{if .UpdateStatus}}{{.UpdateStatus.State}}{{end}}' "$service") || fail "Cannot inspect $service before health-check deadline"
-    case $update in paused|rollback*) fail "Update failed for $service; inspect task history privately" ;; esac
-    ids=$(probe_before_deadline "$deadline" docker service ps --no-trunc -q --filter desired-state=running "$service") || fail "Cannot list $service tasks before health-check deadline"
-    count=0; total=0
-    while IFS= read -r id; do
-      [[ -n $id ]] || continue
-      total=$((total + 1))
-      # Resolve the actual node and container before asking Docker for container health.
-      # 先定位任务实际所在的节点和容器，再向对应节点查询容器健康状态。
-      record=$(probe_before_deadline "$deadline" docker inspect --type task --format '{{.NodeID}}|{{.Status.State}}|{{if .Status.ContainerStatus}}{{.Status.ContainerStatus.ContainerID}}{{end}}' "$id") || fail 'Cannot inspect task before health-check deadline'
-      IFS='|' read -r node state container <<< "$record"
-      [[ $state == running && -n $container ]] || continue
-      # Wrap both local Docker and remote SSH calls with the same deadline.
-      # 本地 Docker 查询和远端 SSH 查询共用同一截止时间。
-      if [[ $node == "$MANAGER_ID" ]]; then
-        health=$(probe_before_deadline "$deadline" docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container" 2>/dev/null) || health=unavailable
-      else
-        [[ $node == "$WORKER_ID" && -n ${WORKER_SSH:-} ]] || fail 'Unknown remote node'
-        printf -v quoted '%q ' docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container"
-        health=$(probe_before_deadline "$deadline" ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 "$WORKER_SSH" "$quoted" 2>/dev/null) || health=unavailable
-      fi
-      (( SECONDS < deadline )) || fail "Health/convergence timeout for $service; no automatic retry or rollback performed"
-      [[ $health != healthy ]] || count=$((count + 1))
-    done <<< "$ids"
-    # Count only healthy tasks that Swarm still wants running.
-    # 仅统计 Swarm 期望继续运行且健康的任务。
-    if (( count == expected && total == expected )) && [[ $update != updating ]]; then
-      (( SECONDS < deadline )) || fail "Health/convergence timeout for $service; no automatic retry or rollback performed"
-      note "$service: $count healthy tasks"
-      return
+# Give each read at most ten seconds of the service wait, including remote inspection.
+# 每次只读查询最多使用服务等待预算中的十秒，远端检查也受此限制。
+health_probe() {
+  local deadline=$1 limit=$((SECONDS + 10))
+  shift
+  probe_before_deadline "$((deadline < limit ? deadline : limit))" "$@" </dev/null 2>/dev/null
+}
+
+# Check one fresh snapshot. On retry, detail tells wait_healthy what was missing.
+# 每轮重新检查。需要重试时，通过 detail 告知 wait_healthy 尚未满足的条件。
+service_healthy() {
+  local service=$1 expected=$2 deadline=$3 required_node=$4
+  local update ids id record node state container health quoted observed_image
+  local -a tasks=() inspect
+  local -A seen=()
+
+  detail='service inspection unavailable'
+  update=$(health_probe "$deadline" docker service inspect --format '{{if .UpdateStatus}}{{.UpdateStatus.State}}{{end}}' "$service") || return 1
+  case $update in
+    ''|completed) ;;
+    failed|paused|rollback*) fail "Update failed for $service ($update); inspect task history privately" ;;
+    *) detail="update state is $update"; return 1 ;;
+  esac
+
+  detail='desired task list unavailable'
+  ids=$(health_probe "$deadline" docker service ps --no-trunc -q --filter desired-state=running "$service") || return 1
+  [[ -z $ids ]] || mapfile -t tasks <<< "$ids"
+  detail="${#tasks[@]} desired tasks, expected $expected"
+  (( ${#tasks[@]} == expected )) || return 1
+  for id in "${tasks[@]}"; do
+    detail='empty or duplicate task ID'
+    [[ -n $id && -z ${seen[$id]:-} ]] || return 1
+    seen[$id]=1
+    detail="inspection unavailable for task $id"
+    record=$(health_probe "$deadline" docker inspect --type task --format '{{.NodeID}}|{{.Status.State}}|{{if .Status.ContainerStatus}}{{.Status.ContainerStatus.ContainerID}}{{end}}' "$id") || return 1
+    IFS='|' read -r node state container <<< "$record"
+    detail="task $id is ${state:-unknown} without a running container"
+    [[ $state == running && -n $container ]] || return 1
+    [[ -z $required_node || $node == "$required_node" ]] || fail "Task $id is on the wrong node for $service"
+    if [[ -n ${5:-} ]]; then
+      detail="task $id has not converged to the approved image"
+      observed_image=$(health_probe "$deadline" docker inspect --type task --format '{{.Spec.ContainerSpec.Image}}' "$id") || return 1
+      [[ $observed_image == "$5" ]] || return 1
     fi
-    sleep 2
+
+    # Inspect the container through the Docker daemon on its assigned node.
+    # 通过任务所在节点的 Docker daemon 检查容器。
+    inspect=(docker inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container")
+    if [[ $node != "$MANAGER_ID" ]]; then
+      [[ -n $node && $node == "$WORKER_ID" && -n ${WORKER_SSH:-} ]] || fail 'Unknown remote node'
+      printf -v quoted '%q ' "${inspect[@]}"
+      inspect=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 "$WORKER_SSH" "$quoted")
+    fi
+    detail="container inspection unavailable for task $id on $node"
+    health=$(health_probe "$deadline" "${inspect[@]}") || return 1
+    detail="task $id on $node reports container state|health ${health:-unknown}"
+    [[ $health == 'running|healthy' ]] || return 1
   done
-  fail "Health/convergence timeout for $service; no automatic retry or rollback performed"
+}
+
+# Retry read-only observations within one deadline; never reuse a partial count.
+# 在同一截止时间内重试只读检查，每轮独立核对全部副本。
+wait_healthy() {
+  local service=$1 expected=$2 deadline=$((SECONDS + DEPLOY_TIMEOUT)) remaining
+  local detail='no observation completed' previous_detail=''
+  while (( SECONDS < deadline )); do
+    if service_healthy "$service" "$expected" "$deadline" "${3:-}" "${4:-}"; then
+      (( SECONDS < deadline )) || { detail='healthy observations arrived too late'; break; }
+      note "$service: $expected healthy tasks"
+      return 0
+    fi
+    remaining=$((deadline - SECONDS))
+    (( remaining > 0 )) || break
+    if [[ $detail != "$previous_detail" ]]; then
+      printf 'Waiting for %s: %s\n' "$service" "$detail" >&2
+      previous_detail=$detail
+    fi
+    sleep "$((remaining < 2 ? remaining : 2))"
+  done
+  fail "Health/convergence timeout for $service: $detail"
 }
 
 # Verify the manager, node placement, storage, and images required for deployment.
@@ -280,6 +319,9 @@ STORAGE
     done
   fi
   for node in "${NODES[@]}"; do
+    if [[ ${1:-} == pull-application ]]; then
+      on_node "$node" docker pull "$AGENTHUB_IMAGE" >/dev/null || fail 'Application image pull failed'
+    fi
     images=$(on_node "$node" docker image inspect "$AGENTHUB_IMAGE" "$POSTGRES_IMAGE" 2>/dev/null) || fail 'Selected images must already be pulled on every node'
     printf '%s' "$images" | python3 -c '
 import json,sys
@@ -311,13 +353,23 @@ check_existing() {
     # 将现有服务定义与本次部署要求的存储及密钥配置进行比对。
     spec_data=$(docker service inspect --format '{{json .Spec}}' "$service") || fail 'Cannot inspect existing service'
     printf '%s' "$spec_data" | python3 -c '
-import json,os,sys
+import json,os,re,sys
 from pathlib import PurePosixPath
 # Use a common diagnostic for settings that require an explicit migration decision.
 # 对需要单独评估迁移的配置差异，使用统一的诊断信息。
 def require(condition):
     if not condition:
         sys.exit("Existing database settings or stack ownership differ; separate review required")
+
+# Normalize only digest-pinned references to the official Docker Hub postgres repository.
+# 仅规范化通过摘要固定的 Docker Hub 官方 postgres 仓库引用。
+def normalize_postgres_image(image):
+    match = re.fullmatch(
+        r"(?:(?:index\.)?docker\.io/)?(?:library/)?postgres"
+        r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@(sha256:[0-9a-f]{64})", image
+    )
+    return "docker.io/library/postgres@" + match[1] if match else image
+
 s=json.load(sys.stdin); name=s["Name"]; target=os.environ["STACK"]+"_db"
 # Check the published port and reject any other service that uses the same TCP port.
 # 检查发布端口，拒绝其他使用相同 TCP 端口的服务。
@@ -339,7 +391,7 @@ if name==target:
     c=s["TaskTemplate"]["ContainerSpec"]
     env=dict(v.split("=",1) for v in c.get("Env",[]))
     require(s.get("Labels",{}).get("com.docker.stack.namespace")==os.environ["STACK"])
-    require(c["Image"]==os.environ["POSTGRES_IMAGE"])
+    require(normalize_postgres_image(c["Image"]) == normalize_postgres_image(os.environ["POSTGRES_IMAGE"]))
     require(env.get("POSTGRES_DB")==os.environ["POSTGRES_DB"] and env.get("POSTGRES_USER")==os.environ["POSTGRES_USER"])
     require(any(m["Type"]=="bind" and m["Source"]==str(path) and m["Target"]=="/var/lib/postgresql/data" for m in mounts))
     require([x["SecretName"] for x in c.get("Secrets",[])]==[os.environ["DB_PASSWORD_SECRET"]])
@@ -388,4 +440,68 @@ online_preflight() {
   inspect_cluster
   check_existing
   note 'Preflight passed: manager, nodes, secrets, storage, cached images and existing database configuration checked.'
+}
+
+run_setup() {
+  local previous id deadline selected completed tasks state exit_code remaining
+  local expected_image=${1:-} observed_image replicas restart_policy
+  local -a launch=(docker service update --detach=true)
+  if [[ -n $expected_image ]]; then launch+=(--image "$expected_image" --with-registry-auth); fi
+  # Require a dormant setup service with retries disabled before launching one task.
+  # 启动单次 setup 前，确认服务处于零副本且禁用了自动重启。
+  replicas=$(docker service inspect --format '{{.Spec.Mode.Replicated.Replicas}}' "${STACK}_setup") || fail 'Cannot inspect setup replica count'
+  [[ $replicas == 0 ]] || fail 'Setup must be at zero before launch'
+  restart_policy=$(docker service inspect --format '{{.Spec.TaskTemplate.RestartPolicy.Condition}}' "${STACK}_setup") || fail 'Cannot inspect setup restart policy'
+  [[ $restart_policy == none ]] || fail 'Setup must not restart automatically'
+  previous=$(docker service ps --no-trunc -q "${STACK}_setup")
+  # Exclude historical tasks when verifying the new setup run.
+  # 验证本次 setup 执行结果时排除历史任务。
+  local -A seen=()
+  while IFS= read -r id; do [[ -z $id ]] || seen["$id"]=1; done <<< "$previous"
+  "${launch[@]}" --replicas 1 --force "${STACK}_setup"
+  deadline=$((SECONDS + DEPLOY_TIMEOUT))
+  selected=''; completed=false
+  # Track one new task and use its terminal state and exit code to decide whether to proceed.
+  # 跟踪本次新增的唯一任务，根据终态和退出码决定是否继续。
+  while (( SECONDS < deadline )); do
+    tasks=$(probe_before_deadline "$deadline" docker service ps --no-trunc -q "${STACK}_setup") || break
+    while IFS= read -r id; do
+      [[ -n $id && -z ${seen[$id]:-} ]] || continue
+      [[ -z $selected || $selected == "$id" ]] || fail 'Multiple new setup tasks detected; stop for review'
+      selected=$id
+    done <<< "$tasks"
+    if [[ -n $selected ]]; then
+      state=$(probe_before_deadline "$deadline" docker inspect --type task --format '{{.Status.State}}' "$selected") || break
+      case $state in
+        complete)
+          if [[ -n $expected_image ]]; then
+            observed_image=$(probe_before_deadline "$deadline" docker inspect --type task --format '{{.Spec.ContainerSpec.Image}}' "$selected") || break
+            [[ $observed_image == "$expected_image" ]] || fail 'Unexpected migration task image'
+          fi
+          exit_code=$(probe_before_deadline "$deadline" docker inspect --type task --format '{{.Status.ContainerStatus.ExitCode}}' "$selected") || break
+          # A completed query must still arrive within the setup wait budget.
+          # 即使查询已完成，结果仍必须在 setup 等待预算内返回。
+          (( SECONDS < deadline )) || break
+          [[ $exit_code == 0 ]] || fail 'Setup returned a nonzero exit code'
+          completed=true; break ;;
+        failed|rejected|orphaned|shutdown) fail "Setup ended unsuccessfully ($state)" ;;
+      esac
+    fi
+    remaining=$((deadline - SECONDS))
+    (( remaining > 0 )) || break
+    sleep "$((remaining < 2 ? remaining : 2))"
+  done
+  [[ $completed == true ]] || fail 'Setup timed out; it may still be running. Do not restart it blindly.'
+  # Return setup to its dormant state so it is ready for the next deployment.
+  # 将 setup 恢复为零副本，为下次部署做好准备。
+  docker service scale --detach=true "${STACK}_setup=0"
+  wait_stopped "${STACK}_setup"
+  # A replacement task may appear between the exit check and scale-down.
+  # 检查退出码后到缩容完成前，可能出现新的替代任务。
+  tasks=$(probe_before_deadline "$((SECONDS + DEPLOY_TIMEOUT))" docker service ps --no-trunc -q "${STACK}_setup") || fail 'Cannot verify final setup task history'
+  while IFS= read -r id; do
+    [[ -z $id || $id == "$selected" ]] && continue
+    [[ -n ${seen[$id]:-} ]] || fail 'Multiple new setup tasks detected at scale-down; inspect migration state before retrying'
+  done <<< "$tasks"
+  note 'Alembic migration and bootstrap completed with exit code 0.'
 }
