@@ -1,6 +1,6 @@
 # AgentHub Backend
 
-AgentHub is a University of Toronto ECE1779 team project. This repository implements authenticated conversations, durable message submission, PostgreSQL-backed jobs, and a separate worker with optional OpenAI text chat. The default fixed-reply mode requires no API key and makes no paid model requests.
+AgentHub is a University of Toronto ECE1779 team project. This repository implements authenticated conversations, durable message submission, PostgreSQL-backed jobs, and a separate worker with optional OpenAI tool selection and chat. The default fixed-reply mode requires no API key and makes no paid model requests.
 
 For a fresh checkout or Codex session, start with the [development handoff](docs/DEVELOPMENT_HANDOFF.md).
 
@@ -16,7 +16,7 @@ The [technology stack guide](docs/TECH_STACK.md) explains the current tools, ver
 
 The API and worker share a Python 3.13 image. PostgreSQL 17 stores users, conversations, messages, jobs, demo orders and refund eligibility results on a persistent volume. Startup waits for database readiness, applies Alembic migrations, initializes the first account, then starts the API and worker.
 
-In fixed mode the worker handles the [simulated refund workflow](docs/WORKER_BASELINE.md#approve-or-reject-a-refund-proposal) and responds to ordinary messages with `Message received.`. Set `REPLY_MODE=openai` and configure a private API key to enable text chat with bounded context, output and retries. The browser receives [live updates over SSE](docs/LIVE_UPDATES.md). Backups and production Swarm deployment remain planned work. The included GitHub Actions workflow builds and tests the containers.
+In fixed mode the worker handles the [simulated refund workflow](docs/WORKER_BASELINE.md#approve-or-reject-a-refund-proposal) and responds to ordinary messages with `Message received.`. Set `REPLY_MODE=openai` and configure a private API key to enable [agent tools and chat](docs/AGENT_EXECUTION.md) with bounded context, calls, time and retries. The browser receives [live updates over SSE](docs/LIVE_UPDATES.md). Backups and production Swarm deployment remain planned work. The included GitHub Actions workflow builds and tests the containers.
 
 ## Quick start
 

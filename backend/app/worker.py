@@ -7,7 +7,6 @@ import socket
 import time
 from collections.abc import Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import timedelta
 from threading import Event, Thread
 from uuid import UUID, uuid4
@@ -16,10 +15,14 @@ from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session, aliased
 
+from app.activity import step_event
+from app.agent import actor, check_deadline, run_agent
+from app.agent_contract import TERMINAL, Decision
 from app.config import positive_number
 from app.db import SessionLocal
 from app.event_store import EventToAppend, append_events, job_status_event, message_created_event
-from app.models import Conversation, Job, Message, ResolutionProposal
+from app.leases import Claim, LostLease, owned_job
+from app.models import AgentStep, Conversation, Job, Message, ResolutionProposal
 from app.replies import FixedReply, ReplySettings, RetryableReplyError, build_reply_provider
 from app.resolution_workflow import (
     append_final_reply,
@@ -27,24 +30,14 @@ from app.resolution_workflow import (
     expire_pending_proposal,
     unfinished_turn_before,
 )
-from app.support_workflow import check_demo_refund_request, parse_prepare_refund, prepare_refund
+from app.support_workflow import (
+    PrepareRefund,
+    check_demo_refund_request,
+    parse_prepare_refund,
+    prepare_refund,
+)
 
 log = logging.getLogger(__name__)
-
-
-# Signal that the current attempt can no longer commit any result.
-# 表示本次处理已失去领取权，不能再提交结果。
-class LostLease(Exception):
-    pass
-
-
-# Carry the job ID and the unique token for this specific claim.
-# 携带待办编号，以及本次领取独有的令牌。
-@dataclass(frozen=True)
-class Claim:
-    job_id: UUID
-    token: UUID
-    kind: str
 
 
 # Clear all ownership fields together to satisfy the job-state constraint.
@@ -114,20 +107,6 @@ def claim_job(owner: str, lease_seconds=60, max_attempts=3) -> Claim | None:
         job.lease_token = uuid4()
         job.lease_expires_at = now + timedelta(seconds=lease_seconds)
         return Claim(job.id, job.lease_token, job.kind)
-
-
-# Use live database time so ownership is checked after any lock wait.
-# 使用数据库实时时间，确保锁等待之后仍重新判断领取权。
-def owned_job(claim):
-    """Build a fencing predicate using the current token and live lease expiry.
-    用当前令牌和实时租约到期时间构造写入条件，阻止旧 Worker 提交结果。
-    """
-    return and_(
-        Job.id == claim.job_id,
-        Job.status == "RUNNING",
-        Job.lease_token == claim.token,
-        Job.lease_expires_at > func.clock_timestamp(),
-    )
 
 
 def renew_lease(claim: Claim, lease_seconds=60):
@@ -248,6 +227,7 @@ def transition_owned_job(
     last_error: str | None = None,
     retry_delay: timedelta | None = None,
     preceding_events: Sequence[EventToAppend] = (),
+    agent_deadline: bool = False,
 ) -> None:
     """Append the transition and recheck ownership before updating the already locked job.
     追加状态变更事件，在更新已加锁的待办前再次校验领取权。
@@ -257,6 +237,8 @@ def transition_owned_job(
     # 存储模块在取得事件计数器锁前写入待保存的业务变更。
     # 最后一次带租约校验的 UPDATE 仅更新调用方已加锁的待办行。
     append_events(session, conversation_id, [*preceding_events, job_status_event(job, status=status)])
+    if agent_deadline:
+        check_deadline(session, job)
     now = func.clock_timestamp()
     availability = {"finished_at": now} if retry_delay is None else {"available_at": now + retry_delay}
     changed = session.execute(
@@ -279,7 +261,7 @@ def transition_owned_job(
         raise LostLease()
 
 
-def retry_job(claim: Claim, *, max_attempts):
+def retry_job(claim: Claim, *, max_attempts, failure="Model temporarily unavailable"):
     """Publish a bounded retry or mark the final attempt as failed.
     记录有次数上限的重试，或将最后一次尝试标记为失败。
     """
@@ -292,7 +274,7 @@ def retry_job(claim: Claim, *, max_attempts):
                 job,
                 conversation_id,
                 status="FAILED",
-                last_error="Model temporarily unavailable; retry limit reached",
+                last_error=failure + "; retry limit reached",
             )
         else:
             # attempts includes the first claim; delay grows exponentially up to 30 s.
@@ -303,14 +285,20 @@ def retry_job(claim: Claim, *, max_attempts):
                 job,
                 conversation_id,
                 status="QUEUED",
-                last_error="Model temporarily unavailable; retry scheduled",
+                last_error=failure + "; retry scheduled",
                 retry_delay=timedelta(seconds=min(2**job.attempts, 30)),
             )
 
 
 # Commit the result and completion together, rechecking ownership before success.
 # 一起提交处理结果与完成状态，在标记成功前再次核对领取权。
-def complete_job(claim: Claim, reply: str | None = None, *, check_refund_requests: bool = False):
+def complete_job(
+    claim: Claim,
+    reply: str | None = None,
+    *,
+    check_refund_requests: bool = False,
+    agent_step: int | None = None,
+):
     """Commit the result and its events under a final check of the worker's lease.
     在最后一次租约校验的保护下提交业务结果及对应事件。
     """
@@ -328,9 +316,33 @@ def complete_job(claim: Claim, reply: str | None = None, *, check_refund_request
         conversation = session.scalar(
             select(Conversation).where(Conversation.id == source.conversation_id).with_for_update()
         )
-        # Continuations use the saved decision. Initial jobs can only query or prepare.
-        # 恢复待办使用已保存的决定，初始待办只能查询或准备方案。
-        if job.kind == "RESUME_EXECUTION":
+        # Terminal decisions, business results and durable events share the final lease fence.
+        # 终结决策、业务结果和持久事件共用最后的租约校验。
+        step = None
+        if agent_step is not None:
+            check_deadline(session, job)
+            actor(session, job)
+            step = session.get(AgentStep, (job.id, agent_step))
+            if (
+                step is None
+                or step.result is not None
+                or step.name not in TERMINAL
+                or job.kind != "PROCESS_MESSAGE"
+            ):
+                raise ValueError("Invalid terminal agent step")
+            decision = Decision(step.name, step.arguments).validated()
+            outcome = (
+                prepare_refund(
+                    session, source.id, conversation.user_id, PrepareRefund.model_validate(decision.arguments)
+                )
+                if decision.name == "prepare_refund"
+                else decision.arguments["text"]
+            )
+            step.result = {
+                "outcome": "WAITING_FOR_APPROVAL" if isinstance(outcome, ResolutionProposal) else "REPLIED"
+            }
+            step.finished_at = func.clock_timestamp()
+        elif job.kind == "RESUME_EXECUTION":
             events = apply_approved_resolution(session, job, conversation)
         else:
             if reply is None or not reply.strip():
@@ -345,8 +357,7 @@ def complete_job(claim: Claim, reply: str | None = None, *, check_refund_request
                         check_demo_refund_request(session, source.id, source.content, conversation.user_id)
                         or reply
                     )
-            # A pending card reserves the final reply slot for the decision or execution.
-            # 待审批卡片为审批决定或执行结果保留最终回复位置。
+        if job.kind != "RESUME_EXECUTION":
             if isinstance(outcome, ResolutionProposal):
                 conversation.updated_at = func.clock_timestamp()
                 session.flush([outcome])
@@ -364,9 +375,19 @@ def complete_job(claim: Claim, reply: str | None = None, *, check_refund_request
             else:
                 message = append_final_reply(session, conversation, source.id, outcome)
                 events = [message_created_event(message)]
+        if step is not None:
+            events.extend(step_event(job, step))
         transition_owned_job(
-            session, claim, job, conversation.id, status="SUCCEEDED", preceding_events=events
+            session,
+            claim,
+            job,
+            conversation.id,
+            status="SUCCEEDED",
+            preceding_events=events,
+            agent_deadline=step is not None,
         )
+        if step is not None:
+            check_deadline(session, job)
 
 
 # Record a sanitized failure only while this worker still owns the job.
@@ -414,6 +435,7 @@ def run_once(
         return False
     provider = provider or FixedReply(reply)
     settings = settings or ReplySettings()
+    started = time.monotonic()
     try:
         # Applying a saved decision is independent of model configuration and availability.
         # 执行已保存的决定与模型配置及模型可用性无关。
@@ -425,8 +447,15 @@ def run_once(
             # Fixed replies ignore history and must preserve the API's 20,000-character limit.
             # 固定回复无需历史，必须保留 API 原有的 20,000 字符接收能力。
             context = [] if provider.mode == "fixed" else load_context(claim, settings)
-            generated = provider.generate(context)
-        complete_job(claim, generated, check_refund_requests=provider.mode == "fixed")
+            if hasattr(provider, "decide"):
+                terminal = run_agent(claim, provider, context, settings)
+            else:
+                generated = provider.generate(context)
+                terminal = None
+        if terminal is not None:
+            complete_job(claim, agent_step=terminal)
+        else:
+            complete_job(claim, generated, check_refund_requests=provider.mode == "fixed")
         log.info("job=%s completed mode=%s", claim.job_id, provider.mode)
     except RetryableReplyError:
         # The queue owns retries; a lost lease must not requeue somebody else's attempt.
@@ -438,15 +467,19 @@ def run_once(
         log.warning("job=%s transient model failure", claim.job_id)
     except LostLease:
         log.warning("job=%s lost ownership; no reply committed", claim.job_id)
-    except OperationalError as exc:
-        # Let the next owner reclaim an interrupted database transaction after its lease expires.
-        # 数据库事务中断时，等待租约到期后由下一次领取接管。
-        if claim.kind != "RESUME_EXECUTION":
-            fail_job(claim, exc)
+    except OperationalError:
+        # Retry recoverable database interruptions for both planning and approved continuations.
+        # 准备阶段和获批恢复阶段的数据库临时中断均可有界重试。
+        try:
+            retry_job(claim, max_attempts=max_attempts, failure="Database temporarily unavailable")
+        except LostLease:
+            pass
         log.warning("job=%s database operation interrupted", claim.job_id)
     except Exception as exc:
         fail_job(claim, exc)
         log.error("job=%s processing failed type=%s", claim.job_id, type(exc).__name__)
+    finally:
+        log.info("job=%s kind=%s duration_seconds=%.3f", claim.job_id, claim.kind, time.monotonic() - started)
     return True
 
 

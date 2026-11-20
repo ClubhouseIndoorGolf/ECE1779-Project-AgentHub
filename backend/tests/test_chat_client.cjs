@@ -11,6 +11,162 @@ const vm = require("node:vm");
 
 const source = fs.readFileSync(path.join(__dirname, "../app/static/chat.js"), "utf8");
 
+// Read visible strings from the minimal DOM without interpreting them as HTML.
+// 从最小 DOM 读取可见文本，不将其解释为 HTML。
+function visibleText(element) {
+  return [element.textContent, ...element.children.map(visibleText)].join(" ");
+}
+
+test("right-click and ellipsis menus persist Unicode rename and pin changes", async () => {
+  let saved = { id: "chat-a", title: "Original", is_pinned: false };
+  const updates = [];
+  const client = createClient(async (url, options) => {
+    if (url === "/conversations/chat-a") {
+      assert.equal(options.method, "PATCH");
+      updates.push(JSON.parse(options.body));
+      saved = { ...saved, ...updates.at(-1) };
+      return response(saved);
+    }
+    if (url === "/conversations") return response([saved]);
+    throw new Error("Unexpected request: " + url);
+  });
+  client.run("authorization = 'Basic test'; conversation = 'chat-a'; conversations = [{id:'chat-a',title:'Original',is_pinned:false}]; drawConversations()");
+  let prevented = false;
+  client.element("conversations").children[0].listeners.get("contextmenu")({preventDefault(){prevented=true;}, clientX:100, clientY:100});
+  assert.equal(prevented, true);
+  assert.equal(client.element("chat-menu").hidden, false);
+  client.element("chat-rename").listeners.get("click")();
+  assert.equal(client.element("chat-action-dialog").open, true);
+  client.element("chat-name").value = "  团队 💬  ";
+  await client.element("chat-action-form").listeners.get("submit")({preventDefault(){}});
+  assert.equal(updates[0].title, "团队 💬");
+  assert.equal(client.element("chat-title").textContent, "团队 💬");
+  assert.equal(client.element("chat-action-dialog").open, false);
+  client.element("conversations").children[0].children[1].listeners.get("click")();
+  await client.element("chat-pin").listeners.get("click")();
+  assert.equal(saved.is_pinned, true);
+  assert.match(visibleText(client.element("conversations")), /📌/);
+  client.element("conversations").children[0].children[1].listeners.get("click")();
+  assert.equal(client.element("chat-pin").textContent, "Unpin");
+  await client.element("chat-pin").listeners.get("click")();
+  assert.equal(saved.is_pinned, false);
+});
+
+test("delete requires confirmation then clears the selected chat and its draft", async () => {
+  let deletes = 0;
+  const client = createClient(async (url, options) => {
+    if (url === "/conversations/chat-a") {
+      assert.equal(options.method, "DELETE");
+      deletes++;
+      return {ok:true,status:204};
+    }
+    if (url === "/conversations") return response([]);
+    throw new Error("Unexpected request: " + url);
+  });
+  client.run("authorization = 'Basic test'; conversation = 'chat-a'; drafts.set('chat-a',{content:'Saved draft'}); conversations = [{id:'chat-a',title:'Delete me'}]; drawConversations()");
+  const openDelete = () => {
+    client.element("conversations").children[0].children[1].listeners.get("click")();
+    client.element("chat-delete").listeners.get("click")();
+  };
+  openDelete();
+  assert.equal(deletes, 0);
+  client.element("chat-action-cancel").listeners.get("click")();
+  assert.equal(deletes, 0);
+  openDelete();
+  await client.element("chat-action-form").listeners.get("submit")({preventDefault(){}});
+  assert.equal(deletes, 1);
+  assert.equal(client.run("conversation"), null);
+  assert.equal(client.run("drafts.has('chat-a')"), false);
+  assert.equal(client.element("chat-title").textContent, "New chat");
+});
+
+test("blocked delete preserves the conversation and explains pending work", async () => {
+  const client = createClient(async () => ({ok:false,status:409}));
+  client.run("authorization = 'Basic test'; conversation = 'chat-a'; conversations = [{id:'chat-a',title:'Pending'}]; drawConversations()");
+  client.element("conversations").children[0].children[1].listeners.get("click")();
+  client.element("chat-delete").listeners.get("click")();
+  await client.element("chat-action-form").listeners.get("submit")({preventDefault(){}});
+  assert.equal(client.run("conversation"), "chat-a");
+  assert.equal(client.element("chat-action-dialog").open, true);
+  assert.match(client.element("chat-action-error").textContent, /reject the pending proposal/);
+  assert.equal(client.run("busy"), false);
+});
+
+test("older conversation list responses cannot overwrite a newer rename", async () => {
+  let oldRead;
+  const client = createClient(async () => new Promise(resolve => {oldRead = resolve;}));
+  client.run("authorization = 'Basic test'");
+  const reading = client.run("listConversations()");
+  client.run("++conversationRead; conversations = [{id:'chat-a',title:'New name'}]; drawConversations()");
+  oldRead(response([{id:"chat-a",title:"Old name"}]));
+  await reading;
+  assert.equal(client.run("conversations[0].title"), "New name");
+});
+
+test("saved activity renders separately and survives repeated history loads", () => {
+  const client = createClient(async () => response([]));
+  client.run(`showMessages([{
+    role: "user", content: "Review my ticket",
+    activity: { status: "SUCCEEDED", attempts: 1, steps: [
+      { seq: 1, status: "completed", text: "Retrieved ticket and order" },
+      { seq: 2, status: "completed", text: "<img src=x onerror=alert(1)>" }
+    ] }
+  }]);`);
+  const panel = client.element("messages").children[1];
+  assert.equal(panel.className, "execution-activity");
+  assert.equal(panel.children[0].children.length, 2);
+  assert.equal(panel.children[0].children[1].children[1].textContent, "<img src=x onerror=alert(1)>");
+  assert.equal(panel.children[0].children[1].children[1].children.length, 0);
+  client.run(`showMessages([{role:"user", content:"Review", activity:{status:"SUCCEEDED", attempts:1,
+    steps:[{seq:1,status:"completed",text:"Retrieved ticket and order"}]}}]);`);
+  assert.equal(client.element("messages").children.length, 2);
+});
+
+test("failed and queued activity never labels an unfinished step successful", () => {
+  const client = createClient(async () => response([]));
+  for (const status of ["FAILED", "QUEUED"]) {
+    client.run(`showMessages([{role:"user", content:"Review", activity:{status:"${status}", attempts:2,
+      steps:[{seq:1,status:"running",text:"Checking refund eligibility"}]}}]);`);
+    const panel = client.element("messages").children[1];
+    assert.equal(panel.children[0].children[0].className, status === "FAILED" ? "activity-stopped" : "activity-waiting");
+    assert.match(visibleText(panel), /Processing attempt 2/);
+    assert.doesNotMatch(visibleText(panel), /✓/);
+  }
+  const failed = client.run(`renderActivity({status:"FAILED",attempts:1,steps:[]}, {status:"INVALIDATED"})`);
+  assert.match(visibleText(failed), /Proposal no longer valid/);
+  assert.doesNotMatch(visibleText(failed), /Simulated refund applied/);
+});
+
+test("pushed activity refreshes saved progress once and restores it on reopening", async t => {
+  let progressStream;
+  let reads = 0;
+  const client = createClient(async (url, options) => {
+    if (url === "/conversations/chat-a/events") {
+      progressStream = sseResponse(options.signal);
+      return progressStream.response;
+    }
+    if (url.includes("/messages?")) {
+      reads++;
+      return response([{role:"user",content:"Review", activity:{status:"RUNNING",attempts:1,
+        steps: reads > 1 ? [{seq:1,status:"completed",text:"Retrieved ticket and order"}] : []}}]);
+    }
+    if (url === "/conversations") return response([]);
+    throw new Error("Unexpected request: " + url);
+  }, streamingGlobals);
+  t.after(() => client.run("newChat()"));
+  await client.run("authorization = 'Basic test'; openConversation({id:'chat-a',title:'Chat A'})");
+  await until(() => progressStream);
+  progressStream.push('event: activity\ndata: {"job_id":"job-1"}\n\n');
+  progressStream.push('event: activity\ndata: {"job_id":"job-1"}\n\n');
+  await until(() => visibleText(client.element("messages")).includes("Retrieved ticket and order"));
+  assert.equal(reads, 2);
+  assert.equal(client.element("messages").children[1].children[0].children.length, 2);
+  client.run("newChat()");
+  assert.doesNotMatch(visibleText(client.element("messages")), /Retrieved ticket/);
+  await client.run("openConversation({id:'chat-a',title:'Chat A'})");
+  assert.match(visibleText(client.element("messages")), /Retrieved ticket and order/);
+});
+
 /** Return a minimal successful fetch response without opening a network connection.
  * 返回最小的成功 fetch 响应，全程不建立网络连接。
  */
@@ -82,6 +238,9 @@ function createClient(handler, extraGlobals = {}) {
      * 接收聚焦请求；键盘导航与视觉焦点仍应在真实浏览器中验证。
      */
     focus() {}
+    showModal() { this.open = true; }
+    close() { this.open = false; }
+    getBoundingClientRect() { return { right: 100, bottom: 100 }; }
   }
 
   /** Reuse stable element identities across initialization and event callbacks.
@@ -115,6 +274,7 @@ function createClient(handler, extraGlobals = {}) {
     matchMedia: () => ({ matches: false, addEventListener() {} }),
     localStorage: { getItem() {}, setItem() {} },
     AbortSignal, crypto: webcrypto, setTimeout, clearTimeout, Date,
+    window: { innerWidth: 1024, innerHeight: 768 },
     btoa: value => Buffer.from(value, "binary").toString("base64"),
     ...extraGlobals,
   });
@@ -211,7 +371,7 @@ test("signing out clears drafts and pending submissions before another account s
 /** Exercise a delayed initial history read after a full send-and-reply workflow finishes.
  * 在完整发送和回复流程结束后再返回初始历史请求，验证旧响应不会覆盖新结果。
  */
-async function delayedHistory({ reject = false, fullPage = false } = {}) {
+async function delayedHistory({ reject = false, missing = false, fullPage = false } = {}) {
   let resolveOld, rejectOld;
   const oldResponse = new Promise((resolve, reject) => { resolveOld = resolve; rejectOld = reject; });
   let historyReads = 0;
@@ -239,8 +399,10 @@ async function delayedHistory({ reject = false, fullPage = false } = {}) {
   // A stale failure must also be ignored; a stale full page must not trigger more pages.
   // 旧请求失败也应被忽略；旧请求返回满页数据时，也不能继续发起后续分页读取。
   if (reject) rejectOld(new TypeError("Late history failure"));
+  else if (missing) resolveOld({ ok: false, status: 404 });
   else resolveOld(response(fullPage ? Array.from({ length: 500 }, () => user) : []));
   await opening;
+  assert.equal(client.run("conversation"), "chat-a");
   assert.equal(client.element("messages").children.length, 2);
   assert.equal(client.element("messages").children[1].children[1].textContent, assistant.content);
   assert.equal(historyReads, 3);
@@ -248,6 +410,7 @@ async function delayedHistory({ reject = false, fullPage = false } = {}) {
 
 test("old history cannot overwrite a newly saved reply", () => delayedHistory());
 test("old history failures do not replace a newer successful state", () => delayedHistory({ reject: true }));
+test("an obsolete history 404 does not clear the active chat", () => delayedHistory({ missing: true }));
 test("superseded history does not fetch additional stale pages", () => delayedHistory({ fullPage: true }));
 
 test("saved proposal restores after a new page loads the same chat", async () => {
@@ -465,11 +628,42 @@ test("a dropped stream reconnects with the last message sequence", async t => {
   client.run("newChat()");
 });
 
-test("a refused stream falls back to polling without retrying", async t => {
+test("a history 404 clears a removed chat and refreshes the sidebar without SSE", async () => {
+  let sidebarReads = 0;
+  const client = createClient(async url => {
+    if (url.startsWith("/conversations/chat-a/messages?")) return { ok: false, status: 404 };
+    if (url === "/conversations") {
+      sidebarReads++;
+      return response([{ id: "chat-b", title: "Other chat" }]);
+    }
+    throw new Error("Unexpected request: " + url);
+  });
+  client.run(`authorization = 'Basic test';
+    conversations = [{ id: 'chat-a', title: 'Removed chat' }];
+    drafts.set('chat-a', { content: 'Old draft', pending: { submission_key: 'old-key' } });
+    drafts.set('chat-b', { content: 'Other draft' });
+    drawConversations();`);
+  await client.element("conversations").children[0].children[0].listeners.get("click")();
+  assert.equal(client.run("conversation"), null);
+  assert.equal(client.run("pending"), null);
+  assert.equal(client.run("drafts.has('chat-a')"), false);
+  assert.equal(client.run("drafts.has('chat-b')"), true);
+  assert.equal(client.element("message").value, "");
+  assert.equal(client.element("message").disabled, false);
+  assert.equal(client.element("chat-title").textContent, "New chat");
+  assert.equal(client.element("messages").children.length, 0);
+  assert.match(client.element("notice").textContent, /chat was removed/);
+  assert.equal(sidebarReads, 1);
+  await until(() => visibleText(client.element("conversations")).includes("Other chat"));
+  assert.doesNotMatch(visibleText(client.element("conversations")), /Removed chat/);
+});
+
+test("a missing conversation stream clears the chat without retrying", async t => {
   let opens = 0;
   const client = createClient(async url => {
     if (url === "/conversations/chat-a/events") { opens++; return { ok: false, status: 404 }; }
     if (url.includes("/messages?")) return response([]);
+    if (url === "/conversations") return response([]);
     throw new Error("Unexpected request: " + url);
   }, streamingGlobals);
   // Close the stream even when an assertion fails, so the runner cannot hang.
@@ -479,8 +673,66 @@ test("a refused stream falls back to polling without retrying", async t => {
   await new Promise(resolve => setTimeout(resolve, 400));
   assert.equal(opens, 1);
   assert.equal(client.run("streamLive()"), false);
+  assert.equal(client.run("conversation"), null);
+  assert.equal(client.element("messages").children.length, 0);
   client.run("newChat()");
 });
+
+// Both deletion signals must release the old submission without touching a newer draft.
+// 两种删除信号都必须释放旧提交，且不覆盖后来输入的草稿。
+for (const delivery of ["event", "reconnect-404"]) {
+  for (const lateFailure of [false, true]) {
+    test(`remote deletion via ${delivery} releases an in-flight send (late failure: ${lateFailure})`, async t => {
+      let activeStream, finishSubmit, failSubmit, opens = 0, sidebarReads = 0;
+      const client = createClient(async (url, options) => {
+        if (url === "/conversations/chat-a/events") {
+          if (++opens > 1 && delivery === "reconnect-404") return {ok:false,status:404};
+          activeStream = sseResponse(options.signal);
+          return activeStream.response;
+        }
+        if (url.endsWith("/messages") && options.method === "POST") {
+          return new Promise((resolve, reject) => { finishSubmit = resolve; failSubmit = reject; });
+        }
+        if (url.includes("/messages?")) return response([{role:"user",content:"Old history",seq:1}]);
+        if (url === "/conversations") { sidebarReads++; return response([{id:"chat-b",title:"Other chat"}]); }
+        throw new Error("Unexpected request: " + url);
+      }, streamingGlobals);
+      t.after(() => { finishSubmit?.(response({job_id:"old-job"})); client.run("newChat()"); });
+      await client.run("authorization = 'Basic test'; conversations = [{id:'chat-a',title:'Old chat'}]; openConversation(conversations[0])");
+      await until(() => activeStream);
+      activeStream.push('event: ready\ndata: {"cursor":1}\n\n');
+      await until(() => client.run("streamLive()"));
+      const sending = client.send("In-flight draft");
+      await until(() => finishSubmit);
+      client.run("drafts.set('chat-a', {content:'Old draft'}); drafts.set('chat-b', {content:'Other draft'})");
+      assert.equal(client.run("busy"), true);
+      if (delivery === "event") activeStream.push('event: conversation.deleted\ndata: {"conversation_id":"chat-a"}\n\n');
+      else activeStream.close();
+      await until(() => client.run("conversation") === null);
+      await until(() => sidebarReads > 0);
+      assert.equal(client.run("busy"), false);
+      assert.equal(client.run("awaitingReply"), false);
+      assert.equal(client.run("pending"), null);
+      assert.equal(client.run("drafts.has('chat-a')"), false);
+      assert.equal(client.run("drafts.has('chat-b')"), true);
+      assert.equal(client.element("message").disabled, false);
+      assert.equal(client.element("new-chat").disabled, false);
+      assert.equal(client.element("messages").children.length, 0);
+      assert.equal(client.element("chat-title").textContent, "New chat");
+      assert.doesNotMatch(visibleText(client.element("conversations")), /Old chat/);
+      client.element("message").value = "New draft";
+      client.run("resizeComposer()");
+      assert.equal(client.element("send").disabled, false);
+      if (lateFailure) failSubmit(new TypeError("Old request failed"));
+      else finishSubmit(response({job_id:"old-job", message_id:"old-message"}));
+      await sending;
+      assert.equal(client.run("busy"), false);
+      assert.equal(client.element("message").value, "New draft");
+      assert.equal(client.element("job-status").textContent, "");
+      assert.doesNotMatch(client.element("notice").textContent, /Old request failed/);
+    });
+  }
+}
 
 test("a failed refresh after a pushed message retries while the stream only sends heartbeats", async t => {
   let stream, historyReads = 0;
@@ -641,7 +893,7 @@ test("signing in as another account after a 401 clears the old workspace during 
   client.element("password").value = "password";
   await login({ preventDefault() {} });
   assert.equal(client.element("account-name").textContent, "bob");
-  assert.equal(client.element("conversations").children[0].textContent, "Bob chat");
+  assert.equal(client.element("conversations").children[0].children[0].textContent, "Bob chat");
   assert.equal(client.element("chat-title").textContent, "New chat");
   assert.equal(client.element("messages").children.length, 0);
   assert.equal(client.element("message").value, "");

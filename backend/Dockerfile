@@ -27,5 +27,6 @@ COPY requirements-dev.txt ./
 RUN pip install --requirement requirements-dev.txt
 COPY pyproject.toml ./
 COPY tests ./tests
+COPY evaluation ./evaluation
 USER app
 CMD ["pytest", "-q"]
