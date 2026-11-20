@@ -53,9 +53,9 @@ from app.resolution_workflow import (
     unfinished_turn_before,
 )
 from app.schemas import (
+    AgentStepOut,
     ConflictCode,
     ConflictOut,
-    AgentStepOut,
     ConversationCreate,
     ConversationOut,
     ConversationUpdate,
