@@ -50,6 +50,8 @@ def restore_test(path, image):
         if archive_digest(archive) != match[2]:
             raise OperationFailed("Local archive checksum mismatch")
         archive.seek(0)
+        if docker("info", "--format", "{{.Swarm.LocalNodeState}}").strip() != b"inactive":
+            raise OperationFailed("Use an independent Docker daemon with Swarm inactive")
         name = f"agenthub-restore-test-{uuid4().hex}"
         print(f"Creating isolated restore container {name}", flush=True)
         container = create_container(name, image)

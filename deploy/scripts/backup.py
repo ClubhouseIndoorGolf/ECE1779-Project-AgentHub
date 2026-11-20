@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 from backup_common import ARCHIVE_NAME, OperationFailed, archive_digest, docker
 
@@ -131,17 +132,30 @@ def run():
         daily_backup(spaces, bucket, stack, datetime.now(timezone.utc).date())
 
 
+def run_with_lock_retries(attempts):
+    for attempt in range(1, attempts + 1):
+        try:
+            run()
+            return
+        except ManagerBusy:
+            if attempt == attempts:
+                raise
+            print(f"Manager lock busy on attempt {attempt}/{attempts}. Retrying in 30 minutes.", flush=True)
+            time.sleep(30 * 60)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--plan", action="store_true", help="Describe the job offline (default)")
-    mode.add_argument("--run", action="store_true", help="Perform the scheduled backup and retention")
+    mode.add_argument("--run", action="store_true", help="Perform one backup and retention attempt")
+    mode.add_argument("--scheduled", action="store_true", help="Run the backup with bounded retries for a busy manager lock")
     args = parser.parse_args(argv)
-    if not args.run:
+    if not (args.run or args.scheduled):
         print("Plan only. Dump PostgreSQL 17, upload privately, verify and retain seven UTC dates.")
         return 0
     try:
-        run()
+        run_with_lock_retries(4 if args.scheduled else 1)
     except ManagerBusy as exc:
         print(exc, file=sys.stderr)
         return 75

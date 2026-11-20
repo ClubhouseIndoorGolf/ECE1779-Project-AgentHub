@@ -9,6 +9,7 @@ import shutil
 import socket
 import ssl
 import subprocess
+import sys
 import tempfile
 import textwrap
 import threading
@@ -201,12 +202,42 @@ source "$SCRIPT/check_volume.sh"
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_approval_command_requires_independent_production_reviewer(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf8")
+        step = workflow.split("      - name: Verify independent production approval\n", 1)[1]
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1].split("      - name:", 1)[0])
+        fake = r'''
+gh() {
+  [[ "$*" == "api repos/team/agenthub/actions/runs/9/approvals" ]] || return 2
+  printf '%s\n' "$REVIEWS"
+  return "$API_STATUS"
+}
+python3() { "$TEST_PYTHON" "$@"; }
+'''
+        valid = {"state": "approved", "user": {"id": 8, "type": "User"}, "environments": [{"name": "production"}]}
+        for label, reviews, attempt, status, accepted in (
+            ("approved", [valid], "1", "0", True),
+            ("no reviews", [], "1", "0", False),
+            ("self approval", [dict(valid, user={"id": 7, "type": "User"})], "1", "0", False),
+            ("missing reviewer", [dict(valid, user={})], "1", "0", False),
+            ("bot reviewer", [dict(valid, user={"id": 8, "type": "Bot"})], "1", "0", False),
+            ("wrong environment", [dict(valid, environments=[{"name": "staging"}])], "1", "0", False),
+            ("rejected", [dict(valid, state="rejected")], "1", "0", False),
+            ("rerun", [valid], "2", "0", False),
+            ("API failure", [valid], "1", "1", False),
+        ):
+            with self.subTest(label=label):
+                env = dict(os.environ, GITHUB_RUN_ATTEMPT=attempt, GITHUB_REPOSITORY="team/agenthub",
+                           GITHUB_RUN_ID="9", GITHUB_ACTOR_ID="7", TEST_PYTHON=sys.executable,
+                           REVIEWS=json.dumps(reviews), API_STATUS=status)
+                result = subprocess.run([BASH, "-c", fake + script], env=env, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
     def test_ssh_request_uses_only_the_digest_approved_for_the_operation(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf8")
         job = workflow.split("\n  deliver:\n", 1)[1]
         for gate in ["environment: production", "github.ref == 'refs/heads/main'",
-                     "needs.publish.result == 'success'", ".user.login != $actor",
-                     '.name == "production"', "StrictHostKeyChecking=yes"]:
+                     "needs.publish.result == 'success'", "StrictHostKeyChecking=yes"]:
             self.assertIn(gate, job)
         step = job.split("      - name: Request the approved manager operation\n", 1)[1]
         script = textwrap.dedent(step.split("        run: |\n", 1)[1])
@@ -316,7 +347,10 @@ class HttpsTests(unittest.TestCase):
                     conn.request("GET", "/events")
                     response = conn.getresponse()
                     self.assertEqual(response.status, 200)
+                    self.assertEqual(response.getheader("Strict-Transport-Security"), "max-age=31536000")
+                    self.assertEqual(response.getheader("Content-Type"), "text/event-stream")
                     self.assertEqual(response.readline(), b"data: ready\n")
+                    self.assertEqual(response.readline(), b"\n")
                 finally:
                     conn.close()
             finally:

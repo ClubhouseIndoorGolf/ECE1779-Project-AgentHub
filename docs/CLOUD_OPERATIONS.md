@@ -101,9 +101,11 @@ systemctl show agenthub-backup.service -p Result -p ExecMainStatus
 ```
 
 A successful journal entry records the verified key and retained count. Check
-the latest successful date as well as the timer's next firing. A busy manager
-lock returns status 75. Systemd retries after 30 minutes, with at most four
-starts in four hours. Other failures require investigation. On a missed day
+the latest successful date as well as the timer's next firing. Install the
+updated backup script and unit together. Each scheduled invocation retries
+only a busy manager lock, waiting 30 minutes between up to four attempts.
+Exhaustion returns status 75. Manual `backup.py --run` makes one attempt.
+The oneshot unit allows 3h30min total, including the waits. On a missed day
 or nonzero service exit, check clock, lock contention, healthy database task,
 staging space, SDK profile and bucket permissions. After fixing the cause, use
 `sudo systemctl start agenthub-backup.service` to retry. Failed listing, dump,
@@ -114,25 +116,63 @@ failures and preserve the affected archives. To suspend future runs use
 
 ## Test one restore in isolation
 
-Use a separate Linux Docker host with free disk for the compressed download and
-expanded database. Cache the approved official PostgreSQL 17 image at the same
-digest as the deployment. Set `POSTGRES_IMAGE` to that reference. Use the AWS
-CLI with the read-only `agenthub-drill` profile and set `SPACES_REGION`,
-`SPACES_BUCKET`, and `KEY` to the selected archive's region, bucket and full
-key from the successful backup journal. Handle the download as private
-application data.
+Use two hosts. On an authorized staging workstation, set `SPACES_REGION` and
+`SPACES_BUCKET` to the verified bucket and `KEY` to the full object key from
+the successful backup journal. Mount encrypted transfer media at `/mnt/drill`.
+Download just that object using the existing read-only profile.
 
 ```bash
+set -euo pipefail
 umask 077
-drill_dir=$(mktemp -d)
-archive="$drill_dir/${KEY##*/}"
+mountpoint -q /mnt/drill
+name=${KEY##*/}
+[[ $name =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-([a-f0-9]{64})\.dump$ ]]
+hash=${BASH_REMATCH[1]}
+mkdir -m 0700 /mnt/drill/agenthub-restore
+archive="/mnt/drill/agenthub-restore/$name"
 aws --profile agenthub-drill --region us-east-1 \
   --endpoint-url "https://${SPACES_REGION}.digitaloceanspaces.com" \
-  s3api get-object --bucket "$SPACES_BUCKET" --key "$KEY" "$archive" &&
-python3 deploy/scripts/restore_test.py --run --archive "$archive" --image "$POSTGRES_IMAGE"
+  s3api get-object --bucket "$SPACES_BUCKET" --key "$KEY" "$archive" >/dev/null
+printf '%s  %s\n' "$hash" "$archive" | sha256sum --check --status
+sync
 ```
 
-The drill checks the SHA-256 in the original filename, then creates a uniquely
+Unmount the media before transferring it. Keep the journal key separately.
+
+Prepare a fresh, independent Linux Docker VM with the reviewed checkout, Python
+3.10+, and space for the expanded database. Keep production disks, network
+mounts and credentials off this VM. Before disconnecting it, cache the exact
+approved PostgreSQL 17 image using its digest from the deployment configuration:
+
+```bash
+set -euo pipefail
+docker --host unix:///var/run/docker.sock pull "${POSTGRES_IMAGE:?set the approved digest-qualified reference}"
+```
+
+Disconnect all VM network adapters in the hypervisor. Use its local console
+and mount the encrypted media read-only at `/mnt/drill`. From the checkout,
+set `KEY` again from the trusted journal record and `POSTGRES_IMAGE` to the
+same approved digest. These preflight checks expect a fresh daemon:
+
+```bash
+set -euo pipefail
+mountpoint -q /mnt/drill
+findmnt -n -o VFS-OPTIONS --mountpoint /mnt/drill | tr ',' '\n' | grep -qx ro
+local_docker=(docker --host unix:///var/run/docker.sock)
+swarm=$("${local_docker[@]}" info --format '{{.Swarm.LocalNodeState}}')
+containers=$("${local_docker[@]}" ps -aq)
+volumes=$("${local_docker[@]}" volume ls -q)
+[[ $swarm == inactive && -z $containers && -z $volumes ]]
+"${local_docker[@]}" image inspect "$POSTGRES_IMAGE" >/dev/null
+python3 deploy/scripts/restore_test.py --run \
+  --archive "/mnt/drill/agenthub-restore/${KEY##*/}" --image "$POSTGRES_IMAGE"
+containers=$("${local_docker[@]}" ps -aq)
+volumes=$("${local_docker[@]}" volume ls -q)
+[[ -z $containers && -z $volumes ]]
+```
+
+The drill checks the SHA-256 in the original filename and rejects an active or
+unknown Swarm state before creating anything. It creates a uniquely
 named container with networking disabled, no published ports, and a fresh
 anonymous data volume. It streams the archive on stdin. All SQL goes to the
 new container's Unix socket and fixed `agenthub_restore_test` database. A
@@ -142,10 +182,11 @@ and the messages and jobs tables. [PostgreSQL 17 restore options](https://www.po
 
 Record the date, key, image digest and exit status as drill evidence. Exit zero
 also requires removal of the test container and anonymous volume. Delete the
-private downloaded file when finished. After a host interruption or cleanup
+private downloaded copy on the staging workstation's encrypted media after
+the drill. After a host interruption or cleanup
 error, inspect the exact generated name printed by the drill and confirm its
 `agenthub.restore-test=true` label before removing that container with
-`docker rm -fv <drill-container-id>`.
+`docker --host unix:///var/run/docker.sock rm -fv <drill-container-id>` on the drill VM.
 
 ## Monitor both Droplets
 

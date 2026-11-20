@@ -16,7 +16,6 @@ Environment=TMPDIR=/var/lib/agenthub-backup
 Environment=AWS_SHARED_CREDENTIALS_FILE=/etc/agenthub-backup/credentials
 Environment=AWS_EC2_METADATA_DISABLED=true
 EnvironmentFile=/etc/agenthub-backup/config
-ExecStart=/opt/agenthub-backup/venv/bin/python /opt/agenthub-backup/backup.py --run
-TimeoutStartSec=2h
-RestartForceExitStatus=75
-RestartSec=30min
+ExecStart=/opt/agenthub-backup/venv/bin/python /opt/agenthub-backup/backup.py --scheduled
+TimeoutStartSec=3h30min
+Restart=no

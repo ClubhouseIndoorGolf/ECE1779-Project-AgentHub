@@ -1,15 +1,17 @@
 """Offline tests for the PostgreSQL backup and isolated restore drill."""
 
+from configparser import ConfigParser
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, timedelta
 import hashlib
 import io
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import Mock, mock_open, patch
+from unittest.mock import Mock, call, mock_open, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import backup
@@ -23,6 +25,7 @@ DUMP = b"PGDMP" + bytes(range(256))
 DIGEST = hashlib.sha256(DUMP).hexdigest()
 IMAGE = "docker.io/library/postgres@sha256:" + "a" * 64
 CONTAINER = "f" * 64
+UNITS = Path(__file__).resolve().parents[1] / "systemd"
 
 
 def key(age):
@@ -213,13 +216,46 @@ class CommandTests(unittest.TestCase):
             self.assertNotIn("private response", output.getvalue())
 
     def test_timer_retries_only_temporary_lock_contention(self):
-        with (patch.object(backup, "run", side_effect=backup.ManagerBusy("busy")),
-              redirect_stderr(io.StringIO())):
-            self.assertEqual(backup.main(["--run"]), 75)
-        unit = (Path(__file__).resolve().parents[1] / "systemd/agenthub-backup.service").read_text()
-        self.assertIn("RestartForceExitStatus=75", unit)
-        self.assertIn("StartLimitBurst=4", unit)
-        self.assertNotIn("Restart=on-failure", unit)
+        unit = ConfigParser(strict=False, interpolation=None)
+        unit.read(UNITS / "agenthub-backup.service")
+        service = unit["Service"]
+        interpreter, script, *scheduled = service["ExecStart"].split()
+        self.assertEqual((interpreter, script, scheduled), (
+            "/opt/agenthub-backup/venv/bin/python", "/opt/agenthub-backup/backup.py", ["--scheduled"]))
+        self.assertEqual(service["Type"], "oneshot")
+        self.assertEqual(service["Restart"], "no")
+        self.assertNotIn("RestartForceExitStatus", service)
+        self.assertEqual(service["TimeoutStartSec"], "3h30min")
+
+        busy = backup.ManagerBusy("busy")
+        for label, args, outcomes, expected in (
+            ("immediate success", scheduled, [None], 0),
+            ("last attempt succeeds", scheduled, [busy, busy, busy, None], 0),
+            ("contention exhausted", scheduled, [busy] * 4, 75),
+            ("backup failure", scheduled, [backup.OperationFailed("invalid archive")], 1),
+            ("network error after contention", scheduled, [busy, OSError("network")], 1),
+            ("manual invocation", ["--run"], [busy], 75),
+        ):
+            with self.subTest(case=label):
+                timeline = Mock()
+                timeline.run.side_effect = outcomes
+                with (patch.object(backup, "run", timeline.run), patch.object(backup.time, "sleep", timeline.sleep),
+                      redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO())):
+                    self.assertEqual(backup.main(args), expected)
+                self.assertEqual(timeline.mock_calls,
+                                 [call.run(), *([call.sleep(1800), call.run()] * (len(outcomes) - 1))])
+
+    @unittest.skipUnless(shutil.which("systemd-analyze"), "native systemd-analyze unavailable")
+    def test_systemd_accepts_backup_service_and_timer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = Path(tmp) / "agenthub-backup.service"
+            unit = (UNITS / service.name).read_text()
+            service.write_text(unit.replace("/opt/agenthub-backup/venv/bin/python", sys.executable))
+            timer = Path(tmp) / "agenthub-backup.timer"
+            shutil.copyfile(UNITS / timer.name, timer)
+            result = subprocess.run(["systemd-analyze", "verify", "--man=no", str(service), str(timer)],
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_docker_timeout_returns_a_sanitized_diagnostic(self):
         with (patch.object(backup_common.subprocess, "run", side_effect=subprocess.TimeoutExpired("docker", 1)),
@@ -266,6 +302,8 @@ class RestoreTests(unittest.TestCase):
     def command(self, *args, **kwargs):
         if self.fail_at in args:
             raise backup.OperationFailed("simulated failure")
+        if args == ("info", "--format", "{{.Swarm.LocalNodeState}}"):
+            return b"inactive\n"
         if args[0] == "create":
             return CONTAINER.encode()
         if args[0] == "inspect":
@@ -286,7 +324,7 @@ class RestoreTests(unittest.TestCase):
     def test_only_new_offline_container_and_anonymous_storage_are_used(self):
         self.drill()
         calls = [c.args for c in self.docker.call_args_list]
-        create = calls[0]
+        create = calls[1]
         self.assertIn("--network=none", create)
         self.assertIn("--pull=never", create)
         self.assertIn("type=volume,dst=/var/lib/postgresql/data", create)
@@ -308,7 +346,15 @@ class RestoreTests(unittest.TestCase):
         self.fail_at = "create"
         with self.assertRaises(backup.OperationFailed):
             self.drill()
-        self.assertEqual([call.args[0] for call in self.docker.call_args_list], ["create", "inspect"])
+        self.assertEqual([call.args[0] for call in self.docker.call_args_list], ["info", "create", "inspect"])
+
+    def test_restore_refuses_swarm_or_unknown_daemon_before_create(self):
+        for state in (b"active", b"pending", b"", backup.OperationFailed("daemon unavailable")):
+            with self.subTest(state=state), self.assertRaises(backup.OperationFailed):
+                self.docker.reset_mock()
+                self.docker.side_effect = [state]
+                self.drill()
+            self.docker.assert_called_once_with("info", "--format", "{{.Swarm.LocalNodeState}}")
 
     def test_lost_create_response_cleans_only_matching_id_and_label(self):
         def lost_response(*args, **kwargs):

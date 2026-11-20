@@ -134,7 +134,18 @@ jobs:
           set -euo pipefail
           test "$GITHUB_RUN_ATTEMPT" = 1
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals" |
-            jq -e --arg actor "$GITHUB_ACTOR" 'any(.[]; .state == "approved" and .user.login != $actor and any(.environments[]; .name == "production"))' >/dev/null
+            python3 -c '
+          import json, os, sys
+          actor = int(os.environ["GITHUB_ACTOR_ID"])
+          reviews = json.load(sys.stdin)
+          def approved(review):
+              reviewer = review.get("user") or {}
+              reviewer_id = reviewer.get("id")
+              return (review.get("state") == "approved" and reviewer.get("type") == "User"
+                      and type(reviewer_id) is int and reviewer_id > 0 and reviewer_id != actor
+                      and any(env.get("name") == "production" for env in review.get("environments", [])))
+          sys.exit(0 if actor > 0 and isinstance(reviews, list) and any(map(approved, reviews)) else 1)
+          '
       - name: Request the approved manager operation
         shell: bash
         env:

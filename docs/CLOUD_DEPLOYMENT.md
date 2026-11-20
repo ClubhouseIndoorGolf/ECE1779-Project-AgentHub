@@ -198,15 +198,16 @@ rotation needs a separate coordinated procedure; changing names alone is unsafe.
    `agenthub-manager ssh-ed25519 <host-public-key>` line). Set environment
    variable `DELIVERY_SSH_TARGET=user@manager-host`. Set repository variable
    `DELIVERY_RUNNER` to a trusted Linux runner label with approved SSH egress,
-   Bash, OpenSSH, gh and jq. Limit firewall access to its known source. The
+   Bash, OpenSSH, gh and Python 3. Limit firewall access to its known source. The
    default label is `ubuntu-latest`. A plan supporting required reviewers is
    necessary for delivery. [GitHub environment protections](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
 5. Dispatch **Release runtime image** on `main` with operation **deploy**.
    Check the verified digest in the publish summary, spare capacity for one
    start-first task, a recent verified backup, and schema compatibility with
-   **both** application versions before approval. The runner checks the review
-   for this run. Use a fresh dispatch for retries. The key can request only
-   deployment or rollback of a digest in the manager's configured repository.
+   **both** application versions before approval. The runner checks the
+   production approval on this run and compares the human reviewer's numeric
+   GitHub ID with the dispatcher's. Use a fresh dispatch for retries. The key
+   can request only deployment or rollback of a digest in the manager's configured repository.
 
 Under the shared lock, the manager verifies the existing stack, records the
 healthy baseline and runs one candidate setup task while the old apps serve.
@@ -461,6 +462,12 @@ test filesystem. Provisioning still requires a separate decision.
    timings, commands and limitations. Keep cleanup explicitly separate from tests.
 
 ## Known limitations and course review
+
+Outstanding acceptance evidence includes a successful [independent restore drill](CLOUD_OPERATIONS.md#test-one-restore-in-isolation),
+public certificate issuance and renewal with authenticated SSE through the deployed hostname,
+and an independently approved deploy and application-only rollback on a two-node rehearsal stack.
+The offline delivery tests simulate GitHub reviews and Swarm tasks. The local
+Caddy test verifies the redirect, a locally issued certificate and SSE event arrival.
 
 One manager is not a control-plane quorum; one pinned DB and its Volume are not
 database HA. Swarm cannot reschedule that DB safely to an unlabeled/empty node.
