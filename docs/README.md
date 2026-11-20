@@ -5,6 +5,9 @@ The [repository README](../README.md) is the English entry point for reviewers a
 | Document | Purpose and status |
 | --- | --- |
 | [Development handoff](DEVELOPMENT_HANDOFF.md) | Fresh-machine setup, merged baseline, regression guarantees and next work |
+| [Chat management](CHAT_MANAGEMENT.md) | Rename, pin and delete controls, API contracts and migration notes |
+| [Agent execution completion plan](EXECUTION_COMPLETION_PLAN.md) | Review of main at `506bc66`, instructor feedback, remaining worker/model work and evaluation criteria |
+| [Agent execution contract](AGENT_EXECUTION.md) | Implemented bounded model tools, checkpoints, stale approval checks, migration and SSE/API handoff |
 | [Setup and team workflow](../README.md) | Current Docker services, accounts, shared access, API examples, tests and migration workflow |
 | [Code structure](CODE_STRUCTURE.md) | A concise map of services, source modules, migrations, tests and the message flow |
 | [Technology stack](TECH_STACK.md) | Current languages, libraries, versions, responsibilities and selection rationale |

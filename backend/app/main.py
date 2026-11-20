@@ -33,6 +33,7 @@ from app.events import (
 )
 from app.history import read_execution_detail, read_history, read_history_snapshot
 from app.models import (
+    AgentStep,
     Conversation,
     ConversationEventHead,
     Execution,
@@ -48,11 +49,16 @@ from app.resolution_workflow import (
     active_resolution_exists,
     close_proposal,
     invalidate_proposal,
+    read_invalidation_reason,
     unfinished_turn_before,
 )
 from app.schemas import (
+    AgentStepOut,
+    ConflictCode,
+    ConflictOut,
     ConversationCreate,
     ConversationOut,
+    ConversationUpdate,
     ExecutionDetailOut,
     JobOut,
     MessageCreate,
@@ -68,6 +74,18 @@ app = FastAPI(
 )
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 log = logging.getLogger(__name__)
+
+
+class ConflictError(Exception):
+    def __init__(self, code: ConflictCode, detail: str):
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+
+
+@app.exception_handler(ConflictError)
+def conflict_error(_request: Request, exc: ConflictError):
+    return JSONResponse(status_code=409, content=ConflictOut(detail=exc.detail, code=exc.code).model_dump())
 
 
 @app.get("/", include_in_schema=False)
@@ -142,7 +160,7 @@ def create_conversation(
 @app.get(
     "/conversations",
     response_model=list[ConversationOut],
-    description="List your conversations, most recently updated first.",
+    description="List your conversations, pinned first, then most recently updated.",
 )
 def list_conversations(
     limit: int = Query(100, ge=1, le=500),
@@ -154,10 +172,78 @@ def list_conversations(
     """
     return session.scalars(
         select(Conversation)
-        .where(Conversation.user_id == user.id)
-        .order_by(Conversation.updated_at.desc(), Conversation.id)
+        .where(Conversation.user_id == user.id, Conversation.deleted_at.is_(None))
+        .order_by(Conversation.is_pinned.desc(), Conversation.updated_at.desc(), Conversation.id)
         .limit(limit)
     ).all()
+
+
+@app.patch("/conversations/{conversation_id}", response_model=ConversationOut)
+def update_conversation(
+    conversation_id: UUID,
+    payload: ConversationUpdate,
+    user: User = Depends(current_user),
+    session: Session = Depends(get_session),
+):
+    """Apply explicit title/pin values under the same lock as message submissions.
+    与消息提交使用相同的锁，写入明确指定的标题或置顶值。
+    """
+    with session.begin():
+        conversation = session.scalar(
+            select(Conversation)
+            .where(
+                Conversation.id == conversation_id,
+                Conversation.user_id == user.id,
+                Conversation.deleted_at.is_(None),
+            )
+            .with_for_update()
+        )
+        if conversation is None:
+            raise HTTPException(404, "Conversation not found")
+        for key, value in payload.model_dump(exclude_unset=True).items():
+            setattr(conversation, key, value)
+        conversation.updated_at = func.clock_timestamp()
+    return conversation
+
+
+@app.delete("/conversations/{conversation_id}", status_code=204)
+def delete_conversation(
+    conversation_id: UUID,
+    user: User = Depends(current_user),
+    session: Session = Depends(get_session),
+):
+    """Hide settled chats without deleting refunds or leaving hidden work running.
+    隐藏已结束的聊天，保留退款记录且不留下隐藏的运行任务。
+    """
+    with session.begin():
+        conversation = session.scalar(
+            select(Conversation)
+            .where(
+                Conversation.id == conversation_id,
+                Conversation.user_id == user.id,
+            )
+            .with_for_update()
+        )
+        if conversation is None:
+            raise HTTPException(404, "Conversation not found")
+        if conversation.deleted_at is not None:
+            return Response(status_code=204)
+        active_job = session.scalar(
+            select(Job.id)
+            .join(Message, Job.source_message_id == Message.id)
+            .where(
+                Message.conversation_id == conversation_id,
+                Job.status.in_(("QUEUED", "RUNNING")),
+            )
+            .limit(1)
+        )
+        if active_job or active_resolution_exists(session, conversation_id):
+            raise HTTPException(
+                409, "Finish active work or reject the pending proposal before deleting this chat."
+            )
+        conversation.deleted_at = func.clock_timestamp()
+        conversation.is_pinned = False
+    return Response(status_code=204)
 
 
 # Lock one conversation and atomically save its message, sequence and job.
@@ -166,6 +252,7 @@ def list_conversations(
     "/conversations/{conversation_id}/messages",
     response_model=SubmissionOut,
     status_code=202,
+    responses={409: {"model": ConflictOut, "description": "Message submission conflict"}},
     description="Save a message and its background job atomically. Reuse submission_key only when retrying the same request.",
 )
 def submit_message(
@@ -182,7 +269,11 @@ def submit_message(
         # 检查会话归属并锁定会话，与 Worker 保存回复时共同保护消息顺序号的分配。
         conversation = session.scalar(
             select(Conversation)
-            .where(Conversation.id == conversation_id, Conversation.user_id == user.id)
+            .where(
+                Conversation.id == conversation_id,
+                Conversation.user_id == user.id,
+                Conversation.deleted_at.is_(None),
+            )
             .with_for_update()
         )
         if not conversation:
@@ -196,7 +287,9 @@ def submit_message(
         )
         if existing:
             if existing.content != payload.content:
-                raise HTTPException(409, "submission_key already used for different content")
+                raise ConflictError(
+                    "IDEMPOTENCY_CONFLICT", "submission_key already used for different content"
+                )
             job_id = session.scalar(
                 select(Job.id).where(Job.source_message_id == existing.id, Job.kind == "PROCESS_MESSAGE")
             )
@@ -204,7 +297,9 @@ def submit_message(
         # Check for a pause after duplicate detection so earlier retries keep their original receipt.
         # 先检查重复提交，再检查审批暂停，使旧请求重试仍能取得原始回执。
         if active_resolution_exists(session, conversation.id):
-            raise HTTPException(409, "Resolve the active refund proposal before sending a new message.")
+            raise ConflictError(
+                "CONVERSATION_BUSY", "Resolve the active refund proposal before sending a new message."
+            )
         # Allocate the sequence and persist the message before creating its foreign-keyed job.
         # 分配顺序号并保存消息，再创建通过外键引用它的任务；任一步失败都会整体回滚。
         message = Message(
@@ -266,7 +361,11 @@ def list_messages(
         # 在请求会话的第一条 SQL 执行前设置隔离级别。
         session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
     conversation = session.scalar(
-        select(Conversation).where(Conversation.id == conversation_id, Conversation.user_id == user.id)
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == user.id,
+            Conversation.deleted_at.is_(None),
+        )
     )
     if not conversation:
         raise HTTPException(404, "Conversation not found")
@@ -328,7 +427,9 @@ async def stream_events(
         with SessionLocal() as session:
             owned = session.scalar(
                 select(Conversation.id).where(
-                    Conversation.id == conversation_id, Conversation.user_id == user.id
+                    Conversation.id == conversation_id,
+                    Conversation.user_id == user.id,
+                    Conversation.deleted_at.is_(None),
                 )
             )
             if owned is None:
@@ -358,7 +459,11 @@ async def stream_events(
     )
 
 
-@app.post("/proposals/{proposal_id}/decision", response_model=ProposalDecisionOut)
+@app.post(
+    "/proposals/{proposal_id}/decision",
+    response_model=ProposalDecisionOut,
+    responses={409: {"model": ConflictOut, "description": "Proposal decision conflict"}},
+)
 def decide_proposal(
     proposal_id: UUID,
     payload: ProposalDecisionIn,
@@ -376,14 +481,18 @@ def decide_proposal(
             .join(Message, Message.conversation_id == Conversation.id)
             .join(Execution, Execution.source_message_id == Message.id)
             .join(ResolutionProposal, ResolutionProposal.execution_id == Execution.id)
-            .where(ResolutionProposal.id == proposal_id, Conversation.user_id == user.id)
+            .where(
+                ResolutionProposal.id == proposal_id,
+                Conversation.user_id == user.id,
+                Conversation.deleted_at.is_(None),
+            )
             .with_for_update(of=Conversation)
         ).one_or_none()
         if row is None:
             raise HTTPException(404, "Proposal not found")
         conversation, proposal, source_seq = row
         if payload.version != PROPOSAL_VERSION:
-            raise HTTPException(409, "Proposal version has changed")
+            raise ConflictError("PROPOSAL_VERSION_CONFLICT", "Proposal version has changed")
         execution = session.get(Execution, proposal.execution_id, with_for_update=True)
 
         # Look up the decision after locking so concurrent retries see the committed receipt.
@@ -391,15 +500,22 @@ def decide_proposal(
         existing = session.get(ProposalDecision, proposal.id)
         if existing is not None:
             if existing.decision != payload.decision:
-                raise HTTPException(409, "A different decision has already been recorded")
+                raise ConflictError("DECISION_CONFLICT", "A different decision has already been recorded")
             return ProposalDecisionOut.model_validate(existing)
         if execution.status != "WAITING_FOR_APPROVAL":
-            raise HTTPException(409, "Proposal is no longer waiting for approval")
+            code: ConflictCode = "PROPOSAL_NOT_PENDING"
+            if (
+                execution.status == "INVALIDATED"
+                and read_invalidation_reason(session, conversation.id, proposal.id) == "EXPIRED"
+            ):
+                code = "PROPOSAL_EXPIRED"
+            raise ConflictError(code, "Proposal is no longer waiting for approval")
         # Upgraded conversations can contain several pending proposals from the planning-only release.
         # 从仅支持准备方案的版本升级时，同一会话可能保留多个待审批方案。
         if session.scalar(select(unfinished_turn_before(conversation.id, source_seq))):
-            raise HTTPException(
-                409, "Resolve earlier turns in this conversation before deciding this proposal"
+            raise ConflictError(
+                "CONVERSATION_BUSY",
+                "Resolve earlier turns in this conversation before deciding this proposal",
             )
         now = session.scalar(select(func.clock_timestamp()))
         if now >= proposal.expires_at:
@@ -449,7 +565,7 @@ def decide_proposal(
 
     # Commit the expiration and its reply before returning the conflict to the client.
     # 先提交失效状态及其回复，再向客户端返回冲突。
-    raise HTTPException(409, "Proposal has expired")
+    raise ConflictError("PROPOSAL_EXPIRED", "Proposal has expired")
 
 
 # Follow the source message to enforce conversation ownership.
@@ -467,8 +583,27 @@ def get_job(job_id: UUID, user: User = Depends(current_user), session: Session =
         select(Job)
         .join(Message, Job.source_message_id == Message.id)
         .join(Conversation, Message.conversation_id == Conversation.id)
-        .where(Job.id == job_id, Conversation.user_id == user.id)
+        .where(Job.id == job_id, Conversation.user_id == user.id, Conversation.deleted_at.is_(None))
     )
     if not job:
         raise HTTPException(404, "Job not found")
     return job
+
+
+@app.get("/jobs/{job_id}/steps", response_model=list[AgentStepOut])
+def get_agent_steps(
+    job_id: UUID,
+    after_seq: int = Query(0, ge=0),
+    user: User = Depends(current_user),
+    session: Session = Depends(get_session),
+):
+    """Expose ordered saved progress after checking the same ownership as job reads.
+    按待办读取相同的归属规则，返回有序的已保存进度。
+    """
+    get_job(job_id, user, session)
+    return session.scalars(
+        select(AgentStep)
+        .where(AgentStep.job_id == job_id, AgentStep.seq > after_seq, AgentStep.finished_at.is_not(None))
+        .order_by(AgentStep.seq)
+        .limit(100)
+    ).all()
