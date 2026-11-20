@@ -208,7 +208,7 @@ function scheduleRefresh(delay = 150, attempt = 0) {
       scheduleRefresh(Math.min(1000 * 2 ** attempt, 10000), attempt + 1);
       return;
     }
-    listConversations().catch(() => {});
+    if (stream === current) listConversations().catch(() => {});
   }, delay);
 }
 
@@ -239,10 +239,10 @@ function stopStream() {
 /** Retire only the current unavailable chat, releasing its pending send immediately.
  * 只清理当前已不可用的会话，并立即释放其待确认提交。
  */
-function conversationUnavailable(current) {
-  if (stream !== current || conversation !== current.conversation || authorization !== current.authorization) return;
-  drafts.delete(conversation);
-  conversations = conversations.filter(row => row.id !== conversation);
+function conversationUnavailable(conversationId, credentials) {
+  if (conversation !== conversationId || authorization !== credentials) return;
+  drafts.delete(conversationId);
+  conversations = conversations.filter(row => row.id !== conversationId);
   awaitingReply = false;
   // The old submit's finally block is fenced out by resetChat's new generation.
   // resetChat 推进代次后，旧提交的 finally 不再执行，所以在此释放提交状态。
@@ -253,7 +253,7 @@ function conversationUnavailable(current) {
   const resetGeneration = generation;
   notice("This chat was removed or is no longer available.");
   listConversations().catch(error => {
-    if (generation === resetGeneration && authorization === current.authorization) notice(error.message);
+    if (generation === resetGeneration && authorization === credentials) notice(error.message);
   });
 }
 
@@ -292,7 +292,7 @@ async function runStream(current) {
       if (response.status === 404) {
         // Deletion can happen while disconnected, so a missed event has the same cleanup path.
         // 断线期间也可能删除会话，漏掉删除事件时使用相同的清理路径。
-        conversationUnavailable(current);
+        if (stream === current) conversationUnavailable(current.conversation, current.authorization);
         return;
       }
       if (!response.ok || !response.body) throw new Error("Live updates unavailable (" + response.status + ")");
@@ -370,7 +370,7 @@ function handleFrame(current, frame) {
     // 补齐上次读取历史之后、本次连接建立之前提交的变化。
     scheduleRefresh();
   } else if (frame.event === "conversation.deleted") {
-    conversationUnavailable(current);
+    conversationUnavailable(current.conversation, current.authorization);
   } else if (frame.event === "job") { noteJob(data); scheduleRefresh(); }
   else if (frame.event === "message" || frame.event === "proposal" || frame.event === "activity") scheduleRefresh();
   else if (frame.event === "error") return false;
@@ -799,6 +799,7 @@ async function listConversations() {
 async function renderMessages(waiting = false) {
   const activeConversation = conversation;
   const activeGeneration = generation;
+  const credentials = authorization;
   const request = ++messageRead;
   if (!activeConversation) return;
 
@@ -806,7 +807,8 @@ async function renderMessages(waiting = false) {
    * 同时检查会话导航变化与同一会话内的并发读取，阻止旧响应覆盖新消息。
    */
   function isCurrent() {
-    return activeConversation === conversation && activeGeneration === generation && request === messageRead;
+    return activeConversation === conversation && activeGeneration === generation
+      && credentials === authorization && request === messageRead;
   }
 
   let rows = [], after = 0;
@@ -818,6 +820,10 @@ async function renderMessages(waiting = false) {
       // A superseded failure must not replace the notice or status of a newer successful send.
       // 已失效请求的错误不能覆盖后续成功发送的提示或状态，当前请求失败才继续抛出。
       if (!isCurrent()) return;
+      if (error.status === 404) {
+        conversationUnavailable(activeConversation, credentials);
+        return;
+      }
       throw error;
     }
     // Stop stale pagination immediately, including after sign-out or a newer history refresh.
