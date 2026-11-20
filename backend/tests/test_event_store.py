@@ -175,6 +175,12 @@ def test_upgrade_event_branch_preserves_refund_and_proposal_history(client):
     pending_history = client.get(pending_path, auth=bob_auth).json()
     assert completed_history[0]["proposal"]["status"] == "COMPLETED"
     assert pending_history[0]["proposal"]["status"] == "WAITING_FOR_APPROVAL"
+    completed_detail_path = f"/executions/{completed_history[0]['execution_id']}"
+    pending_detail_path = f"/executions/{pending_history[0]['execution_id']}"
+    completed_detail = client.get(completed_detail_path).json()
+    pending_detail = client.get(pending_detail_path, auth=bob_auth).json()
+    assert completed_detail["result"]["refund_amount_minor"] == "12999"
+    assert pending_detail["result"] is None
     with SessionLocal() as session:
         refund_before = session.execute(select(AppliedResolution.__table__)).one()
 
@@ -188,6 +194,8 @@ def test_upgrade_event_branch_preserves_refund_and_proposal_history(client):
     # 核对公开数据和完整业务结果，再检查迁移后分配的首个序号。
     assert client.get(completed_path).json() == completed_history
     assert client.get(pending_path, auth=bob_auth).json() == pending_history
+    assert client.get(completed_detail_path).json() == completed_detail
+    assert client.get(pending_detail_path, auth=bob_auth).json() == pending_detail
     assert client.post(decision_path, json=approval).json() == receipt
     with SessionLocal.begin() as session:
         assert session.execute(select(AppliedResolution.__table__)).one() == refund_before

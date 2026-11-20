@@ -39,6 +39,10 @@ def test_activity_stream_history_and_replay(client, demo_tickets):
     assert history["activity"]["status"] == "SUCCEEDED"
     assert history["activity"]["steps"][-1]["text"] == "Prepared proposal for human review"
     assert history["proposal"]["status"] == "WAITING_FOR_APPROVAL"
+    detail = client.get(f"/executions/{history['execution_id']}")
+    assert detail.status_code == 200
+    assert detail.json()["proposal_id"] == history["proposal"]["id"]
+    assert detail.json()["source_message_id"] == receipt["message_id"]
     with SessionLocal() as session:
         events = session.scalars(
             select(ConversationEvent)

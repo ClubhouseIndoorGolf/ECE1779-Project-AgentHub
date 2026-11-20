@@ -31,7 +31,7 @@ from app.events import (
     parse_durable_cursor,
     parse_last_event_id,
 )
-from app.history import read_history, read_history_snapshot
+from app.history import read_execution_detail, read_history, read_history_snapshot
 from app.models import (
     AgentStep,
     Conversation,
@@ -56,6 +56,7 @@ from app.schemas import (
     ConversationCreate,
     ConversationOut,
     ConversationUpdate,
+    ExecutionDetailOut,
     JobOut,
     MessageCreate,
     MessageOut,
@@ -309,7 +310,7 @@ def submit_message(
     response_model=list[MessageOut],
     response_model_exclude_unset=True,
     description=(
-        "Read your conversation's messages and attached proposals. The first page (after_seq=0) includes "
+        "Read your conversation's messages, saved execution IDs and proposals. The first page (after_seq=0) includes "
         "an X-Conversation-Event-Cursor header for durable SSE. Use after_seq and limit for pagination."
     ),
     responses={
@@ -357,6 +358,23 @@ def list_messages(
         response.headers["X-Conversation-Event-Cursor"] = durable_cursor(seq)
         return messages
     return read_history(session, conversation_id, after_seq, limit)
+
+
+@app.get(
+    "/executions/{execution_id}",
+    response_model=ExecutionDetailOut,
+    description="Read the saved eligibility, approval and simulated refund result for an execution you own.",
+    responses={404: {"description": "Execution not found"}},
+)
+def get_execution(
+    execution_id: UUID,
+    user: User = Depends(current_user),
+    session: Session = Depends(get_session),
+) -> ExecutionDetailOut:
+    detail = read_execution_detail(session, execution_id, user.id)
+    if detail is None:
+        raise HTTPException(404, "Execution not found")
+    return detail
 
 
 # Check ownership once, then stream committed changes for that conversation.

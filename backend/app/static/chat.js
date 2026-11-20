@@ -236,6 +236,27 @@ function stopStream() {
   connection();
 }
 
+/** Retire only the current unavailable chat, releasing its pending send immediately.
+ * 只清理当前已不可用的会话，并立即释放其待确认提交。
+ */
+function conversationUnavailable(current) {
+  if (stream !== current || conversation !== current.conversation || authorization !== current.authorization) return;
+  drafts.delete(conversation);
+  conversations = conversations.filter(row => row.id !== conversation);
+  awaitingReply = false;
+  // The old submit's finally block is fenced out by resetChat's new generation.
+  // resetChat 推进代次后，旧提交的 finally 不再执行，所以在此释放提交状态。
+  // A separate metadata mutation still owns its busy state until it settles.
+  // 独立的会话资料修改仍持有忙碌状态，直到其请求结束。
+  if (!chatMutation) setBusy(false);
+  resetChat();
+  const resetGeneration = generation;
+  notice("This chat was removed or is no longer available.");
+  listConversations().catch(error => {
+    if (generation === resetGeneration && authorization === current.authorization) notice(error.message);
+  });
+}
+
 /** Open a stream for the current conversation unless one is already serving it.
  * 为当前会话打开事件流；若已有同一会话和账号的流在运行则保持不变。
  */
@@ -269,9 +290,9 @@ async function runStream(current) {
       });
       if (response.status === 401) { authExpired(current); return; }
       if (response.status === 404) {
-        // Ownership changed; polling remains available and reports the error.
-        // 会话归属已变化；保留轮询路径，由普通请求显示错误。
-        if (stream === current) { current.live = false; connection(); }
+        // Deletion can happen while disconnected, so a missed event has the same cleanup path.
+        // 断线期间也可能删除会话，漏掉删除事件时使用相同的清理路径。
+        conversationUnavailable(current);
         return;
       }
       if (!response.ok || !response.body) throw new Error("Live updates unavailable (" + response.status + ")");
@@ -349,9 +370,7 @@ function handleFrame(current, frame) {
     // 补齐上次读取历史之后、本次连接建立之前提交的变化。
     scheduleRefresh();
   } else if (frame.event === "conversation.deleted") {
-    drafts.delete(conversation);
-    resetChat();
-    listConversations().catch(error => notice(error.message));
+    conversationUnavailable(current);
   } else if (frame.event === "job") { noteJob(data); scheduleRefresh(); }
   else if (frame.event === "message" || frame.event === "proposal" || frame.event === "activity") scheduleRefresh();
   else if (frame.event === "error") return false;

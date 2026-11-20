@@ -146,3 +146,21 @@ HTTP check confirmed healthy OpenAI mode, the new static assets and all three
 saved tool steps from the earlier live refund-proposal check. This verification
 did not call the live model again or exercise a cloud deployment. The browser-state
 suite is an offline DOM harness, not a full browser visual test.
+
+## PR #9 review follow-up
+
+Integrated `main` at `b3148e1` (PR #8). History retains both `execution_id` and
+`activity`, alongside proposal revalidation fields. Execution-detail reads now
+exclude removed conversations, with regression coverage for a completed refund
+whose audit record remains stored after chat removal.
+
+The browser uses one guarded cleanup path for a pushed deletion and an SSE
+connection returning 404. It releases the removed chat's pending submission,
+clears its history/draft, and refreshes the sidebar without accepting late replies
+from that chat. The new timing tests reproduced both reported regressions before
+the fix and pass afterward, including late successful and failed submissions.
+
+Verification on the merged source: **195 isolated PostgreSQL backend tests** and
+**31 offline browser-state tests passed**; Ruff lint/format and Compose validation
+passed, and runtime/test images built successfully. No new paid model calls were
+used. The existing FastAPI/Starlette deprecation warning remains non-failing.
