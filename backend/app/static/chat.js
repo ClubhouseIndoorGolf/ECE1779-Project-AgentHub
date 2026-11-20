@@ -14,6 +14,10 @@ let generation = 0;
 let messageRead = 0;
 let pending = null;
 let conversations = [];
+let conversationRead = 0;
+let chatMenu = null;
+let chatAction = null;
+let chatMutation = false;
 let resumeAfterLogin = false;
 const drafts = new Map();
 const pendingDecisions = new Set();
@@ -38,9 +42,9 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 /** Call an authenticated same-origin endpoint with a bounded request timeout.
  * 携带内存中的认证信息调用同源接口，并限制单次请求的等待时间。
  */
-async function api(path, body, credentials = authorization) {
+async function api(path, body, credentials = authorization, method = body === undefined ? "GET" : "POST") {
   const response = await fetch(path, {
-    method: body === undefined ? "GET" : "POST",
+    method,
     headers: { Authorization: credentials, "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
     cache: "no-store",
@@ -56,7 +60,7 @@ async function api(path, body, credentials = authorization) {
         : "Request failed (" + response.status + "). Please try again.";
     throw Object.assign(new Error(message), { status: response.status });
   }
-  return response.json();
+  return response.status === 204 ? null : response.json();
 }
 
 /** Set or clear an accessible error notice in the workspace or sign-in dialog.
@@ -204,7 +208,7 @@ function scheduleRefresh(delay = 150, attempt = 0) {
       scheduleRefresh(Math.min(1000 * 2 ** attempt, 10000), attempt + 1);
       return;
     }
-    listConversations().catch(() => {});
+    if (stream === current) listConversations().catch(() => {});
   }, delay);
 }
 
@@ -230,6 +234,27 @@ function stopStream() {
   stream = null;
   clearTimeout(refreshTimer);
   connection();
+}
+
+/** Retire only the current unavailable chat, releasing its pending send immediately.
+ * 只清理当前已不可用的会话，并立即释放其待确认提交。
+ */
+function conversationUnavailable(conversationId, credentials) {
+  if (conversation !== conversationId || authorization !== credentials) return;
+  drafts.delete(conversationId);
+  conversations = conversations.filter(row => row.id !== conversationId);
+  awaitingReply = false;
+  // The old submit's finally block is fenced out by resetChat's new generation.
+  // resetChat 推进代次后，旧提交的 finally 不再执行，所以在此释放提交状态。
+  // A separate metadata mutation still owns its busy state until it settles.
+  // 独立的会话资料修改仍持有忙碌状态，直到其请求结束。
+  if (!chatMutation) setBusy(false);
+  resetChat();
+  const resetGeneration = generation;
+  notice("This chat was removed or is no longer available.");
+  listConversations().catch(error => {
+    if (generation === resetGeneration && authorization === credentials) notice(error.message);
+  });
 }
 
 /** Open a stream for the current conversation unless one is already serving it.
@@ -265,9 +290,9 @@ async function runStream(current) {
       });
       if (response.status === 401) { authExpired(current); return; }
       if (response.status === 404) {
-        // Ownership changed; polling remains available and reports the error.
-        // 会话归属已变化；保留轮询路径，由普通请求显示错误。
-        if (stream === current) { current.live = false; connection(); }
+        // Deletion can happen while disconnected, so a missed event has the same cleanup path.
+        // 断线期间也可能删除会话，漏掉删除事件时使用相同的清理路径。
+        if (stream === current) conversationUnavailable(current.conversation, current.authorization);
         return;
       }
       if (!response.ok || !response.body) throw new Error("Live updates unavailable (" + response.status + ")");
@@ -344,8 +369,10 @@ function handleFrame(current, frame) {
     // Catch up on anything committed between the last history read and this connection.
     // 补齐上次读取历史之后、本次连接建立之前提交的变化。
     scheduleRefresh();
-  } else if (frame.event === "job") noteJob(data);
-  else if (frame.event === "message" || frame.event === "proposal") scheduleRefresh();
+  } else if (frame.event === "conversation.deleted") {
+    conversationUnavailable(current.conversation, current.authorization);
+  } else if (frame.event === "job") { noteJob(data); scheduleRefresh(); }
+  else if (frame.event === "message" || frame.event === "proposal" || frame.event === "activity") scheduleRefresh();
   else if (frame.event === "error") return false;
   return true;
 }
@@ -500,6 +527,9 @@ function renderProposal(proposal) {
  * 以纯文本消息及其来源消息所附带的方案重建历史。
  */
 function showMessages(rows, waiting = false) {
+  const pane = $("messages");
+  const follow = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 80;
+  const previousScroll = pane.scrollTop;
   $("chat").classList.toggle("has-messages", rows.length > 0 || waiting);
   $("messages").replaceChildren();
   for (const row of rows) {
@@ -513,6 +543,7 @@ function showMessages(rows, waiting = false) {
     text.textContent = row.content;
     article.append(label, text);
     $("messages").append(article);
+    if (row.activity) $("messages").append(renderActivity(row.activity, row.proposal));
     // Rebuild cards from the same history snapshot as their originating messages.
     // 方案卡片和来源消息使用同一份历史快照进行重建。
     if (row.proposal) {
@@ -520,7 +551,7 @@ function showMessages(rows, waiting = false) {
       if (row.proposal.status === "QUEUED" || row.proposal.status === "RUNNING") watchResolution(row.proposal);
     }
   }
-  if (waiting) {
+  if (waiting && !rows.some(row => row.activity && ["QUEUED", "RUNNING"].includes(row.activity.status))) {
     // The waiting row is local presentation state, never a persisted assistant message.
     // 等待提示仅属于本地界面状态，不会作为助手消息写入数据库。
     const thinking = document.createElement("div");
@@ -528,25 +559,218 @@ function showMessages(rows, waiting = false) {
     thinking.textContent = "Working on it";
     $("messages").append(thinking);
   }
-  $("messages").scrollTop = $("messages").scrollHeight;
+  pane.scrollTop = follow || previousScroll === 0 ? pane.scrollHeight : previousScroll;
 }
+
+/** Show saved tool activity separately from the assistant's answer, using text only.
+ * 用纯文本独立显示已保存的工具进度，与助手答复区分。
+ */
+function renderActivity(activity, proposal) {
+  const panel = document.createElement("section");
+  panel.className = "execution-activity";
+  panel.setAttribute("aria-label", "Agent activity");
+  const list = document.createElement("ol");
+  const add = (text, state) => {
+    const item = document.createElement("li");
+    item.className = "activity-" + state;
+    const mark = document.createElement("span");
+    mark.className = "activity-mark";
+    mark.setAttribute("aria-hidden", "true");
+    mark.textContent = { completed: "✓", running: "◌", waiting: "○", stopped: "!" }[state];
+    const label = document.createElement("span");
+    label.textContent = text;
+    item.append(mark, label);
+    list.append(item);
+  };
+  const active = ["QUEUED", "RUNNING"].includes(activity.status);
+  for (const step of activity.steps) {
+    const state = step.status === "running" ? (active ? (activity.status === "QUEUED" ? "waiting" : "running") : "stopped") : step.status;
+    add(step.text + (state === "stopped" ? " — not completed" : ""), state);
+  }
+  if (activity.attempts > 1) add("Processing attempt " + activity.attempts + " — saved progress retained", "waiting");
+  if (activity.status === "QUEUED") add(activity.attempts ? "Temporary interruption — retry scheduled" : "Queued", "waiting");
+  else if (activity.status === "RUNNING") add("Agent working", "running");
+  else if (activity.status === "FAILED") add("Execution stopped before completion", "stopped");
+  const outcome = {
+    WAITING_FOR_APPROVAL: ["Waiting for your approval — no refund applied", "waiting"],
+    QUEUED: ["Approval saved — execution queued", "waiting"],
+    RUNNING: ["Rechecking current facts and applying approved resolution", "running"],
+    COMPLETED: ["Simulated refund applied and ticket resolved", "completed"],
+    REJECTED: ["Proposal rejected — no refund applied", "stopped"],
+    INVALIDATED: ["Proposal no longer valid — prepare a new proposal for approval", "stopped"],
+    FAILED: ["Approved execution stopped before completion", "stopped"],
+  }[proposal?.status];
+  if (outcome) add(...outcome);
+  panel.hidden = list.children.length === 0;
+  panel.append(list);
+  return panel;
+}
+
+/** Keep one menu bound to its chat, including when opened by keyboard or touch.
+ * 鼠标、键盘与触屏共用一个菜单，并始终绑定正确的会话。
+ */
+function closeChatMenu(restoreFocus = false) {
+  if (restoreFocus) chatMenu?.anchor.focus();
+  chatMenu = null;
+  $("chat-menu").hidden = true;
+}
+
+function openChatMenu(row, anchor, x, y) {
+  if (busy || !authorization) return;
+  closeChatMenu();
+  chatMenu = { row, anchor };
+  $("chat-pin").textContent = row.is_pinned ? "Unpin" : "Pin";
+  const rect = anchor.getBoundingClientRect();
+  const menu = $("chat-menu");
+  menu.hidden = false;
+  menu.style.left = Math.max(8, Math.min(x ?? rect.right, window.innerWidth - menu.offsetWidth - 8)) + "px";
+  menu.style.top = Math.max(8, Math.min(y ?? rect.bottom, window.innerHeight - menu.offsetHeight - 8)) + "px";
+  $("chat-rename").focus();
+}
+
+function closeChatAction() {
+  if ($("chat-action-dialog").open) $("chat-action-dialog").close();
+  chatAction = null;
+}
+
+function openChatAction(kind) {
+  if (!chatMenu || busy) return;
+  const row = chatMenu.row;
+  closeChatMenu(true);
+  chatAction = { kind, row, auth: authorization };
+  const deleting = kind === "delete";
+  $("chat-action-title").textContent = deleting ? "Delete chat?" : "Rename chat";
+  $("chat-action-description").textContent = deleting
+    ? 'Remove "' + row.title + '" from your chat history? Refund and audit records will be retained. This cannot be undone in the app.'
+    : "Choose a name for this conversation.";
+  $("chat-name-field").hidden = deleting;
+  $("chat-name").disabled = deleting;
+  $("chat-name").value = row.title;
+  $("chat-action-submit").textContent = deleting ? "Delete" : "Save";
+  $("chat-action-submit").classList.toggle("delete-confirm", deleting);
+  notice("", "chat-action-error");
+  $("chat-action-dialog").showModal();
+  $(deleting ? "chat-action-cancel" : "chat-name").focus();
+}
+
+/** Persist explicit values, fence account changes, and refresh the authoritative list.
+ * 保存明确值、隔离账号切换，并刷新权威会话列表。
+ */
+async function changeChat(row, kind, value) {
+  if (busy || chatMutation || !authorization) return;
+  const activeAuth = authorization;
+  chatMutation = true;
+  ++conversationRead;
+  setBusy(true);
+  $("chat-action-submit").disabled = true;
+  $("chat-action-cancel").disabled = true;
+  notice();
+  try {
+    const body = kind === "rename" ? { title: value } : kind === "pin" ? { is_pinned: value } : undefined;
+    const updated = await api("/conversations/" + row.id, body, activeAuth, kind === "delete" ? "DELETE" : "PATCH");
+    if (authorization !== activeAuth) return;
+    if (kind === "delete") {
+      drafts.delete(row.id);
+      conversations = conversations.filter(item => item.id !== row.id);
+      if (conversation === row.id) resetChat();
+    } else {
+      conversations = conversations.map(item => item.id === row.id ? updated : item);
+      if (conversation === row.id) $("chat-title").textContent = updated.title;
+    }
+    closeChatAction();
+    drawConversations();
+    await listConversations();
+  } catch (error) {
+    if (authorization !== activeAuth) return;
+    const message = kind === "delete" && error.status === 409
+      ? "Finish active work or reject the pending proposal before deleting this chat."
+      : error.message;
+    notice(message, $("chat-action-dialog").open ? "chat-action-error" : "notice");
+  } finally {
+    chatMutation = false;
+    if (authorization === activeAuth) setBusy(false);
+    $("chat-action-submit").disabled = false;
+    $("chat-action-cancel").disabled = false;
+  }
+}
+
+$("chat-rename").addEventListener("click", () => openChatAction("rename"));
+$("chat-delete").addEventListener("click", () => openChatAction("delete"));
+$("chat-pin").addEventListener("click", () => {
+  if (!chatMenu) return;
+  const row = chatMenu.row;
+  closeChatMenu(true);
+  return changeChat(row, "pin", !row.is_pinned);
+});
+$("chat-action-cancel").addEventListener("click", closeChatAction);
+$("chat-action-dialog").addEventListener("cancel", event => {
+  if (chatMutation) event.preventDefault();
+  else chatAction = null;
+});
+$("chat-action-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  if (!chatAction || chatAction.auth !== authorization) return;
+  const title = $("chat-name").value.trim();
+  if (chatAction.kind === "rename" && (!title || [...title].length > 200)) {
+    notice("Enter a chat name between 1 and 200 characters.", "chat-action-error");
+    return;
+  }
+  await changeChat(chatAction.row, chatAction.kind, title);
+});
+document.addEventListener("pointerdown", event => {
+  if (chatMenu && !$("chat-menu").contains(event.target) && !chatMenu.anchor.contains(event.target)) closeChatMenu();
+});
+$("conversations").addEventListener("scroll", () => closeChatMenu());
+$("chat-menu").addEventListener("keydown", event => {
+  const items = [$("chat-rename"), $("chat-pin"), $("chat-delete")];
+  const index = items.indexOf(event.target);
+  if (event.key === "Escape") { event.preventDefault(); closeChatMenu(true); }
+  else if (event.key === "Tab") closeChatMenu();
+  else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+    event.preventDefault();
+    const next = event.key === "Home" ? 0 : event.key === "End" ? 2 : (index + (event.key === "ArrowDown" ? 1 : 2)) % 3;
+    items[next].focus();
+  }
+});
 
 /** Filter loaded conversation titles and rebuild the selected, busy-aware navigation list.
  * 根据标题筛选已加载的会话，并重建包含选中状态与禁用状态的导航列表。
  */
 function drawConversations() {
+  closeChatMenu();
   const query = $("search").value.trim().toLowerCase();
   const rows = conversations.filter(row => row.title.toLowerCase().includes(query));
   $("conversations").replaceChildren();
   $("chat-count").textContent = conversations.length || "";
   for (const row of rows) {
+    const container = document.createElement("div");
+    container.className = "conversation-row";
     const button = document.createElement("button");
-    button.textContent = row.title;
+    button.className = "conversation-open";
+    button.textContent = (row.is_pinned ? "📌 " : "") + row.title;
     button.title = row.title;
     button.setAttribute("aria-current", String(row.id === conversation));
     button.disabled = busy;
     button.addEventListener("click", () => openConversation(row).catch(error => notice(error.message)));
-    $("conversations").append(button);
+    const more = document.createElement("button");
+    more.className = "conversation-more";
+    more.textContent = "⋯";
+    more.setAttribute("aria-label", "Actions for " + row.title);
+    more.setAttribute("aria-haspopup", "menu");
+    more.disabled = busy;
+    more.addEventListener("click", () => openChatMenu(row, more));
+    container.addEventListener("contextmenu", event => {
+      event.preventDefault();
+      openChatMenu(row, more, event.clientX, event.clientY);
+    });
+    button.addEventListener("keydown", event => {
+      if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+        event.preventDefault();
+        openChatMenu(row, more);
+      }
+    });
+    container.append(button, more);
+    $("conversations").append(container);
   }
   if (!rows.length) {
     const empty = document.createElement("p");
@@ -562,8 +786,9 @@ function drawConversations() {
  */
 async function listConversations() {
   const activeAuth = authorization;
+  const request = ++conversationRead;
   const rows = await api("/conversations");
-  if (activeAuth !== authorization) return;
+  if (activeAuth !== authorization || request !== conversationRead) return;
   conversations = rows;
   drawConversations();
 }
@@ -574,6 +799,7 @@ async function listConversations() {
 async function renderMessages(waiting = false) {
   const activeConversation = conversation;
   const activeGeneration = generation;
+  const credentials = authorization;
   const request = ++messageRead;
   if (!activeConversation) return;
 
@@ -581,7 +807,8 @@ async function renderMessages(waiting = false) {
    * 同时检查会话导航变化与同一会话内的并发读取，阻止旧响应覆盖新消息。
    */
   function isCurrent() {
-    return activeConversation === conversation && activeGeneration === generation && request === messageRead;
+    return activeConversation === conversation && activeGeneration === generation
+      && credentials === authorization && request === messageRead;
   }
 
   let rows = [], after = 0;
@@ -593,6 +820,10 @@ async function renderMessages(waiting = false) {
       // A superseded failure must not replace the notice or status of a newer successful send.
       // 已失效请求的错误不能覆盖后续成功发送的提示或状态，当前请求失败才继续抛出。
       if (!isCurrent()) return;
+      if (error.status === 404) {
+        conversationUnavailable(activeConversation, credentials);
+        return;
+      }
       throw error;
     }
     // Stop stale pagination immediately, including after sign-out or a newer history refresh.
@@ -639,6 +870,8 @@ function restoreDraft(id) {
  * 打开空白会话输入框，并使上一个会话尚未完成的读取失效。
  */
 function resetChat() {
+  closeChatMenu();
+  closeChatAction();
   generation++;
   pending = null;
   conversation = null;
@@ -872,6 +1105,7 @@ $("message-form").addEventListener("submit", async event => {
         awaitingReply = false;
         pending = null;
         status("Failed");
+        await renderMessages();
         throw new Error(job.last_error || "The reply could not be completed.");
       }
       if (job.status === "SUCCEEDED") {
@@ -884,6 +1118,7 @@ $("message-form").addEventListener("submit", async event => {
         if (generation === currentGeneration) await listConversations();
         return;
       }
+      if (!streamLive()) await renderMessages(true);
     }
     throw new Error("Still waiting. Send the same text again to check this job without duplicating it.");
   } catch (error) {

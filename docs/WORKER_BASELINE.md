@@ -1,6 +1,6 @@
 # Worker baseline
 
-The worker processes durable chat jobs with fixed replies or optional model text generation. Fixed mode also supports a read-only refund check backed by simulated orders in PostgreSQL.
+The worker processes durable chat jobs with fixed commands or optional model-selected tools and replies. Both modes use application policy and human approval for simulated refunds. See [Agent execution](AGENT_EXECUTION.md) for durable steps, budgets and the integration contract.
 
 ## Run locally
 
@@ -30,7 +30,7 @@ MODEL_CONTEXT_CHARS=12000
 
 Then run `docker compose up -d --build --wait` to recreate the configured services. Never paste a key in chat, commit it, or print resolved Compose configuration in a shared log. The key is passed only to the worker container. Setting `openai` mode without a key fails worker startup; it does not silently switch to a simulated answer.
 
-The configured model must support the Responses API and `reasoning.effort=none`. Model selection stays configurable. In model mode, context has both a message-count limit and a character limit. An individual message exceeding the context character limit fails explicitly rather than silently truncating the request. Fixed mode does not load model context and preserves the API's 20,000-character message limit. The browser composer retains its 12,000-character limit for compatibility with the default model settings. The model sees the current message and recent earlier turns from that conversation only. The refund demo runs in fixed mode using the application policy.
+The configured model must support the Responses API and `reasoning.effort=none`. Model selection stays configurable. In model mode, context has both a message-count limit and a character limit. An individual message exceeding the context character limit fails explicitly rather than silently truncating the request. Fixed mode does not load model context and preserves the API's 20,000-character message limit. The browser composer retains its 12,000-character limit for compatibility with the default model settings. The model sees the current message and recent earlier turns from that conversation only. Fixed commands and live tool selection both invoke the application policy. Serialized tool evidence shares the model context budget.
 
 These controls reduce spending but are **not a dollar-denominated spending cap**. Use the API account's billing controls as well. Do not run large workloads before reviewing usage. Recovered attempts may repeat a paid model request, although only the current claim can save its reply.
 
@@ -40,7 +40,7 @@ These controls reduce spending but are **not a dollar-denominated spending cap**
 - Jobs run in user-message order within each conversation; independent conversations can run on different replicas. A failed earlier job does not block later messages.
 - Database sessions are closed before model calls. A heartbeat renews the lease in independent short transactions every one-third of the lease duration.
 - Every completion, renewal and failure checks the current claim token and expiry. A stale worker cannot save an answer after another worker takes ownership.
-- The worker uses the OpenAI Python SDK's Responses API with `store=False`, no tools, bounded output, and no SDK retries. PostgreSQL remains the application's source of conversation history.
+- The worker uses the OpenAI Python SDK's Responses API with `store=False`, a strict tool allowlist, bounded output, and no SDK retries. PostgreSQL remains the application's source of conversation history.
 - Connection errors, temporary rate limits and selected transient HTTP failures requeue the same job with exponential delay, bounded by `WORKER_MAX_ATTEMPTS` (default 3). Exhausted credits, invalid credentials, rejected requests, incomplete output and blank output fail visibly. Provider error bodies are not written to public errors or logs.
 - The assistant message and job success are committed together using the existing unique reply constraint. Worker interruption can repeat a model call but cannot produce two saved replies for the same source message.
 - `/health` reports database connectivity and configured reply mode. It is not a worker heartbeat or model-availability check. The smoke check exercises the actual worker.

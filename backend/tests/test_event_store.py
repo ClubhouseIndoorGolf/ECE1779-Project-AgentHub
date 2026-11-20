@@ -147,7 +147,7 @@ def test_append_rolls_back_with_caller_business_write(client):
         assert append_events(session, conversation, [EventToAppend("proposal.decided", {})]) == [2]
 
 
-def test_upgrade_from_0006_preserves_refund_and_proposal_history(client):
+def test_upgrade_event_branch_preserves_refund_and_proposal_history(client):
     """Migrate actual workflow data and start each existing chat at an empty cursor.
     迁移实际业务流程数据，并为每个已有会话初始化空游标。
     """
@@ -184,10 +184,10 @@ def test_upgrade_from_0006_preserves_refund_and_proposal_history(client):
     with SessionLocal() as session:
         refund_before = session.execute(select(AppliedResolution.__table__)).one()
 
-    # Downgrading the additive event migration leaves a populated 0006 business schema.
-    # 回退只新增事件表的迁移，得到带有业务数据的 0006 数据库。
+    # Remove only event storage while preserving the agent branch's revalidation evidence.
+    # 仅移除事件存储，保留 Agent 分支的重新核验依据。
     cfg = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
-    command.downgrade(cfg, "0006_approved_resolutions")
+    command.downgrade(cfg, "0007_conversation_events@0006_approved_resolutions")
     command.upgrade(cfg, "head")
 
     # Compare public data and the full business result, then check the first allocated sequence.

@@ -4,9 +4,19 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.config import database_url
+from app.config import database_url, positive_number
 
-engine = create_engine(database_url(), pool_pre_ping=True, connect_args={"options": "-c timezone=UTC"})
+# Bound lock waits and statements independently of the worker lease.
+# 分别限制锁等待和语句执行时长，不依赖 worker 租约结束。
+lock_ms = max(1, int(positive_number("DB_LOCK_TIMEOUT_MS", "5000")))
+statement_ms = max(1, int(positive_number("DB_STATEMENT_TIMEOUT_MS", "15000")))
+engine = create_engine(
+    database_url(),
+    pool_pre_ping=True,
+    connect_args={
+        "options": f"-c timezone=UTC -c lock_timeout={lock_ms} -c statement_timeout={statement_ms}"
+    },
+)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 

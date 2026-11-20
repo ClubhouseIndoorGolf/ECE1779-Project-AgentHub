@@ -14,10 +14,11 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.activity import read_activity
 from app.db import SessionLocal
 from app.event_store import MAX_EVENT_PAGE_SIZE, MAX_EVENT_SEQ, read_events
 from app.history import read_history, read_proposals
-from app.models import Job, Message
+from app.models import Conversation, Job, Message
 from app.schemas import ConversationEventOut, JobEventOut
 
 log = logging.getLogger(__name__)
@@ -36,6 +37,24 @@ REPLAY_PAGE = MAX_EVENT_PAGE_SIZE
 ACTIVE_JOB_STATES = ("QUEUED", "RUNNING")
 LAST_EVENT_ID = re.compile(r"[0-9]{1,19}")
 DURABLE_EVENT_ID = re.compile(r"v2:([0-9]{1,19})")
+
+
+class ConversationRemoved(Exception):
+    """Stop existing streams when the owner removes a settled chat.
+    所有者移除已结束的聊天后，停止已有事件流。
+    """
+
+
+def check_conversation_visible(session, conversation_id):
+    if (
+        session.scalar(
+            select(Conversation.id).where(
+                Conversation.id == conversation_id, Conversation.deleted_at.is_(None)
+            )
+        )
+        is None
+    ):
+        raise ConversationRemoved()
 
 
 def encode(event: str, data: str, event_id: int | str | None = None) -> str:
@@ -82,6 +101,7 @@ class ConversationStream:
         self.conversation_id = conversation_id
         self.last_seq = last_seq
         self.job_states: dict[UUID, tuple[str, int]] = {}
+        self.activity_states: dict[str, str] = {}
         self.proposal_states: dict[UUID, tuple[str, str | None]] | None = None
         self.since = None
 
@@ -91,6 +111,7 @@ class ConversationStream:
         """
         frames: list[str] = []
         with SessionLocal() as session:
+            check_conversation_visible(session, self.conversation_id)
             now = session.scalar(select(func.clock_timestamp()))
             if self.last_seq is None:
                 # A fresh connection starts at the current end; clients load earlier history over REST.
@@ -130,6 +151,16 @@ class ConversationStream:
                 if self.job_states.get(job.id) != state:
                     self.job_states[job.id] = state
                     frames.append(encode("job", JobEventOut.model_validate(job).model_dump_json()))
+
+            # Publish changed snapshots; reconnects also load persisted activity through history.
+            # 推送变化的快照，重连时也通过历史接口恢复持久化进度。
+            for source_id, activity in read_activity(
+                session, [job.source_message_id for job in jobs]
+            ).items():
+                data = json.dumps({"source_message_id": str(source_id), **activity})
+                if self.activity_states.get(activity["job_id"]) != data:
+                    self.activity_states[activity["job_id"]] = data
+                    frames.append(encode("activity", data))
 
             # Proposals change status in place, so compare them against the connection baseline.
             # 方案状态在原记录上变化，因此与连接建立时的基线进行比较。
@@ -172,6 +203,7 @@ class DurableConversationStream:
         # Read only one page per session. A full page can be followed immediately by another read.
         # 每次数据库会话只读一页。读满一页后可以立即继续读取。
         with SessionLocal() as session:
+            check_conversation_visible(session, self.conversation_id)
             rows = read_events(session, self.conversation_id, self.last_seq, REPLAY_PAGE)
         for row in rows:
             event = ConversationEventOut(
@@ -202,6 +234,9 @@ async def conversation_events(
             return
         try:
             frames = await run_in_threadpool(stream.poll)
+        except ConversationRemoved:
+            yield encode("conversation.deleted", json.dumps({"conversation_id": str(stream.conversation_id)}))
+            return
         except SQLAlchemyError as exc:
             # End the stream so the client reconnects; never send SQL details.
             # 结束事件流让客户端重连；不向客户端发送 SQL 细节。

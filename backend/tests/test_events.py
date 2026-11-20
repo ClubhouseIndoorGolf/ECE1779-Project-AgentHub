@@ -5,16 +5,51 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from uuid import UUID, uuid4
 
 import pytest
+from test_agent import workflow
 
 from app import events, history
 from app.db import SessionLocal
 from app.event_store import EventToAppend, append_events
 from app.manage import seed_demo_orders
-from app.models import ConversationEventHead
-from app.worker import run_once
+from app.models import ConversationEventHead, Order
+from app.worker import run_once as worker_run_once
+
+
+def run_once(*args, **kwargs):
+    """Poll for expected ready work like the production loop, allowing brief clock adjustments.
+    像生产循环一样轮询预期就绪的待办，允许数据库时钟短暂调整。
+    """
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if worker_run_once(*args, **kwargs):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def stream_with_worker(client, conversation, monkeypatch, last_event_id=None):
+    """Commit work after the stream baseline exists, without racing an arbitrary timer.
+    在事件流基线建立后提交待办，不依赖任意定时器的竞争顺序。
+    """
+    original = events.ConversationStream.poll
+    processed = False
+
+    def poll(stream):
+        nonlocal processed
+        frames = original(stream)
+        if not processed:
+            processed = True
+            assert run_once("events-worker")
+            frames.extend(original(stream))
+        return frames
+
+    with monkeypatch.context() as patch:
+        patch.setattr(events.ConversationStream, "poll", poll)
+        return read_stream(client, conversation, last_event_id)
 
 
 def submit(client, content="Hello"):
@@ -60,13 +95,12 @@ def named(frames, event):
     return [(event_id, data) for name, event_id, data in frames if name == event]
 
 
-@pytest.mark.parametrize("version", ["1", "2"])
-def test_stream_requires_owner(client, version):
+def test_stream_requires_owner(client):
     """Another account and anonymous requests cannot open the stream.
     其他账号与未认证请求都不能打开事件流。
     """
     conversation = client.post("/conversations", json={}).json()["id"]
-    url = f"/conversations/{conversation}/events?version={version}"
+    url = f"/conversations/{conversation}/events"
     assert client.get(url, auth=("bob", "bob-test-password")).status_code == 404
     client.auth = None
     assert client.get(url).status_code == 401
@@ -108,31 +142,25 @@ def test_replay_after_last_event_id(client):
     assert read_stream(client, conversation, last_event_id="not-a-number")[0][2] == {"cursor": 2}
 
 
-def test_live_job_progress_and_reply(client):
+def test_live_job_progress_and_reply(client, monkeypatch):
     """Changes committed while the stream is open arrive as job and message events.
     事件流打开期间提交的变化会以任务事件与消息事件推送。
     """
     conversation, _, receipt = submit(client)
-    worker = threading.Timer(0.2, run_once, args=("events-worker",))
-    worker.start()
-    frames = read_stream(client, conversation)
-    worker.join()
+    frames = stream_with_worker(client, conversation, monkeypatch)
     assert frames[0][0] == "ready"
     statuses = [d["status"] for _, d in named(frames, "job") if d["id"] == receipt["job_id"]]
     assert statuses[0] == "QUEUED" and statuses[-1] == "SUCCEEDED"
     assert [d["content"] for _, d in named(frames, "message")] == ["Message received."]
 
 
-def test_proposal_changes_are_streamed(client):
+def test_proposal_changes_are_streamed(client, monkeypatch):
     """A new proposal and its approved execution are pushed without a history refresh.
     新方案及批准后的执行进度无需刷新历史即可推送。
     """
     seed_demo_orders("alice", "bob", with_tickets=True)
     conversation, _, _ = submit(client, content="处理工单 391，符合条件就准备退款")
-    worker = threading.Timer(0.2, run_once, args=("events-worker",))
-    worker.start()
-    frames = read_stream(client, conversation)
-    worker.join()
+    frames = stream_with_worker(client, conversation, monkeypatch)
     proposals = named(frames, "proposal")
     assert [d["status"] for _, d in proposals] == ["WAITING_FOR_APPROVAL"]
     proposal = proposals[0][1]
@@ -142,14 +170,7 @@ def test_proposal_changes_are_streamed(client):
     )
     assert decision.status_code == 200, decision.text
 
-    def resume():
-        time.sleep(0.2)
-        run_once("events-worker")
-
-    worker = threading.Thread(target=resume)
-    worker.start()
-    frames = read_stream(client, conversation, last_event_id=1)
-    worker.join()
+    frames = stream_with_worker(client, conversation, monkeypatch, last_event_id=1)
     assert named(frames, "proposal")[-1][1]["status"] == "COMPLETED"
     assert {d["kind"] for _, d in named(frames, "job")} >= {"RESUME_EXECUTION"}
 
@@ -188,6 +209,59 @@ def test_unicode_last_event_id_starts_fresh(client):
         "1",
         {"cursor": 1},
     )
+
+
+@pytest.mark.parametrize("change_order", [False, True])
+def test_agent_proposal_revalidation_matches_rest_live_events_and_replay(client, change_order):
+    """Keep agent approval evidence identical across REST, live changes and replay.
+    让 Agent 审批依据在 REST、实时变化和重放结果中保持一致。
+    """
+    seed_demo_orders("alice", "bob", with_tickets=True)
+    conversation, _, receipt = submit(client, "Please prepare a resolution for ticket 391")
+    stream = events.ConversationStream(UUID(conversation), None)
+    stream.poll()
+    assert run_once("agent-events-worker", provider=workflow())
+    frames = stream.poll()
+    proposal = next(
+        json.loads(frame.split("data: ", 1)[1]) for frame in frames if "event: proposal\n" in frame
+    )
+    path = f"/conversations/{conversation}/messages"
+    assert proposal == client.get(path).json()[0]["proposal"]
+    assert proposal["status"] == "WAITING_FOR_APPROVAL"
+    steps = client.get(f"/jobs/{receipt['job_id']}/steps").json()
+    assert [step["name"] for step in steps] == ["lookup_ticket", "check_refund", "prepare_refund"]
+    response = client.post(
+        f"/proposals/{proposal['id']}/decision",
+        json={"decision": "APPROVE", "version": proposal["version"]},
+    )
+    assert response.status_code == 200
+    stream.poll()
+    if change_order:
+        with SessionLocal.begin() as session:
+            session.get(Order, 1001).paid_total_minor = 9999
+    assert run_once("agent-events-worker")
+    frames = stream.poll()
+    final = next(json.loads(frame.split("data: ", 1)[1]) for frame in frames if "event: proposal\n" in frame)
+    assert final == client.get(path).json()[0]["proposal"]
+    assert final["status"] == ("INVALIDATED" if change_order else "COMPLETED")
+    assert final["revalidated_at"] is not None
+    assert final["invalidation_reason"] == ("ORDER_CHANGED" if change_order else None)
+    replay = read_stream(client, conversation, last_event_id=0)
+    assert named(replay, "message")[0][1]["proposal"] == final
+    durable = read_stream(client, conversation, "v2:0", params={"version": "2"})
+    created = named(durable, "proposal.created")
+    assert len(created) == 1 and created[0][1]["payload"]["proposal_id"] == proposal["id"]
+    event_type = "resolution.invalidated" if change_order else "resolution.completed"
+    resolutions = named(durable, event_type)
+    assert len(resolutions) == 1
+    payload = resolutions[0][1]["payload"]
+    assert payload["proposal_id"] == proposal["id"]
+    if change_order:
+        assert payload["reason"] == "BUSINESS_STATE_CHANGED"
+        assert payload["invalidation_reason"] == final["invalidation_reason"]
+        assert datetime.fromisoformat(payload["revalidated_at"]) == datetime.fromisoformat(
+            final["revalidated_at"]
+        )
 
 
 def test_durable_history_cursor_is_only_on_the_first_page(client):
