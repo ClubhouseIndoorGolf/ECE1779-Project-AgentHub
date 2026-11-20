@@ -16,8 +16,10 @@ native dialogs. Delete focuses Cancel initially and requires confirmation.
 `PATCH /conversations/{id}` accepts explicit `title` and/or `is_pinned` values.
 `DELETE /conversations/{id}` returns 204, including repeated deletion by the same
 owner. Other-account and unknown IDs return 404. Deleted chats cannot accept new
-messages or decisions; their history, job and steps endpoints return 404. Existing
+messages or decisions; their history, execution-detail, job and steps endpoints return 404. Existing
 SSE connections close with `conversation.deleted`, clearing that chat in the UI.
+A reconnect that returns 404 performs the same cleanup, including releasing an
+in-flight submission's composer state and refreshing the sidebar.
 
 Migration `0009_conversation_management` adds `is_pinned` (default false) and
 nullable `deleted_at`. Apply it before deploying this API/worker release. It

@@ -627,11 +627,12 @@ test("a dropped stream reconnects with the last complete durable event ID", asyn
   client.run("newChat()");
 });
 
-test("a refused stream falls back to polling without retrying", async t => {
+test("a missing conversation stream clears the chat without retrying", async t => {
   let opens = 0;
   const client = createClient(async url => {
     if (url === "/conversations/chat-a/events?version=2") { opens++; return { ok: false, status: 404 }; }
     if (url.includes("/messages?")) return response([]);
+    if (url === "/conversations") return response([]);
     throw new Error("Unexpected request: " + url);
   }, streamingGlobals);
   // Close the stream even when an assertion fails, so the runner cannot hang.
@@ -641,8 +642,156 @@ test("a refused stream falls back to polling without retrying", async t => {
   await new Promise(resolve => setTimeout(resolve, 400));
   assert.equal(opens, 1);
   assert.equal(client.run("streamLive()"), false);
+  assert.equal(client.run("conversation"), null);
+  assert.equal(client.element("messages").children.length, 0);
   client.run("newChat()");
 });
+
+// Both deletion signals must release the old submission without touching a newer draft.
+// 两种删除信号都必须释放旧提交，且不覆盖后来输入的草稿。
+for (const delivery of ["event", "reconnect-404"]) {
+  for (const lateFailure of [false, true]) {
+    test(`remote deletion via ${delivery} releases an in-flight send (late failure: ${lateFailure})`, async t => {
+      let activeStream, finishSubmit, failSubmit, opens = 0, sidebarReads = 0;
+      const client = createClient(async (url, options) => {
+        if (url === "/conversations/chat-a/events?version=2") {
+          if (++opens > 1 && delivery === "reconnect-404") return {ok:false,status:404};
+          activeStream = sseResponse(options.signal);
+          return activeStream.response;
+        }
+        if (url.endsWith("/messages") && options.method === "POST") {
+          return new Promise((resolve, reject) => { finishSubmit = resolve; failSubmit = reject; });
+        }
+        if (url.includes("/messages?")) return response([{role:"user",content:"Old history",seq:1}]);
+        if (url === "/conversations") { sidebarReads++; return response([{id:"chat-b",title:"Other chat"}]); }
+        throw new Error("Unexpected request: " + url);
+      }, streamingGlobals);
+      t.after(() => { finishSubmit?.(response({job_id:"old-job"})); client.run("newChat()"); });
+      await client.run("authorization = 'Basic test'; conversations = [{id:'chat-a',title:'Old chat'}]; openConversation(conversations[0])");
+      await until(() => activeStream);
+      activeStream.push('event: ready\ndata: {"cursor":"v2:1"}\n\n');
+      await until(() => client.run("streamLive()"));
+      const sending = client.send("In-flight draft");
+      await until(() => finishSubmit);
+      client.run("drafts.set('chat-a', {content:'Old draft'}); drafts.set('chat-b', {content:'Other draft'})");
+      assert.equal(client.run("busy"), true);
+      if (delivery === "event") activeStream.push('event: conversation.deleted\ndata: {"conversation_id":"chat-a"}\n\n');
+      else activeStream.close();
+      await until(() => client.run("conversation") === null);
+      await until(() => sidebarReads > 0);
+      assert.equal(client.run("busy"), false);
+      assert.equal(client.run("awaitingReply"), false);
+      assert.equal(client.run("pending"), null);
+      assert.equal(client.run("drafts.has('chat-a')"), false);
+      assert.equal(client.run("drafts.has('chat-b')"), true);
+      assert.equal(client.element("message").disabled, false);
+      assert.equal(client.element("new-chat").disabled, false);
+      assert.equal(client.element("messages").children.length, 0);
+      assert.equal(client.element("chat-title").textContent, "New chat");
+      assert.doesNotMatch(visibleText(client.element("conversations")), /Old chat/);
+      client.element("message").value = "New draft";
+      client.run("resizeComposer()");
+      assert.equal(client.element("send").disabled, false);
+      if (lateFailure) failSubmit(new TypeError("Old request failed"));
+      else finishSubmit(response({job_id:"old-job", message_id:"old-message"}));
+      await sending;
+      assert.equal(client.run("busy"), false);
+      assert.equal(client.element("message").value, "New draft");
+      assert.equal(client.element("job-status").textContent, "");
+      assert.doesNotMatch(client.element("notice").textContent, /Old request failed/);
+    });
+  }
+}
+
+// Reviewer timing: history renders, then the cursor snapshot finds the chat removed in another tab.
+// Review 中的时序：历史已显示，随后获取游标的快照发现会话已在其他标签页被删除。
+test("a snapshot 404 after history renders clears the removed chat without opening its stream", async t => {
+  let resolveSnapshot, opens = 0, sidebarReads = 0;
+  const client = createClient(async (url, options) => {
+    if (url === "/conversations/chat-a/messages?after_seq=0&limit=1") {
+      return new Promise(resolve => { resolveSnapshot = resolve; });
+    }
+    if (url === "/conversations/chat-a/messages?after_seq=0&limit=500") {
+      return response([{ role: "user", content: "Old history", seq: 1 }]);
+    }
+    if (url.startsWith("/conversations/chat-a/events")) { opens++; return sseResponse(options.signal).response; }
+    if (url === "/conversations") { sidebarReads++; return response([{ id: "chat-b", title: "Other chat" }]); }
+    throw new Error("Unexpected request: " + url);
+  }, { ...streamingGlobals, snapshotFetch: true });
+  t.after(() => { resolveSnapshot?.({ ok: false, status: 404 }); client.run("newChat()"); });
+  await client.run("authorization = 'Basic test'; conversations = [{id:'chat-a',title:'Old chat'}, {id:'chat-b',title:'Other chat'}]; drawConversations()");
+  client.run("drafts.set('chat-a', {content:'Old draft'}); drafts.set('chat-b', {content:'Other draft'})");
+  await client.run("openConversation(conversations[0])");
+
+  // The ordinary history read finished first, so chat-a's old message is on screen.
+  // 普通历史请求先完成，chat-a 的旧消息已经显示。
+  assert.equal(client.run("conversation"), "chat-a");
+  assert.match(visibleText(client.element("messages")), /Old history/);
+  assert.match(visibleText(client.element("conversations")), /Old chat/);
+  await until(() => resolveSnapshot);
+  assert.equal(sidebarReads, 0);
+
+  resolveSnapshot({ ok: false, status: 404 });
+  await until(() => client.run("conversation") === null);
+  await until(() => sidebarReads > 0);
+  assert.equal(client.element("messages").children.length, 0);
+  assert.doesNotMatch(visibleText(client.element("messages")), /Old history/);
+  assert.equal(client.element("chat-title").textContent, "New chat");
+  assert.equal(client.run("drafts.has('chat-a')"), false);
+  assert.equal(client.run("drafts.has('chat-b')"), true);
+  assert.doesNotMatch(visibleText(client.element("conversations")), /Old chat/);
+  assert.match(visibleText(client.element("conversations")), /Other chat/);
+  assert.equal(client.element("notice").textContent, "This chat was removed or is no longer available.");
+  assert.equal(client.run("stream"), null);
+  // No stream was ever opened for the removed chat, even after the reconnect delay.
+  // 即使等过重连间隔，也从未为已删除的会话打开事件流。
+  await new Promise(resolve => setTimeout(resolve, 400));
+  assert.equal(opens, 0);
+  assert.equal(client.element("message").disabled, false);
+  client.element("message").value = "New draft";
+  client.run("resizeComposer()");
+  assert.equal(client.element("send").disabled, false);
+});
+
+// A late 404 for a chat the user already left must not clear the chat opened since.
+// 用户已离开的会话迟到返回 404 时，不能清除之后打开的会话。
+for (const stage of ["snapshot", "stream"]) {
+  test(`a late ${stage} 404 from a previous chat leaves the newly opened chat intact`, async t => {
+    let resolveLate, sidebarReads = 0;
+    const held = () => new Promise(resolve => { resolveLate = resolve; });
+    const client = createClient(async (url, options) => {
+      if (url === "/conversations/chat-a/messages?after_seq=0&limit=1") {
+        return stage === "snapshot" ? held() : { ok: true, headers: { get: () => "v2:0" } };
+      }
+      if (url === "/conversations/chat-a/events?version=2") return held();
+      if (url === "/conversations/chat-b/messages?after_seq=0&limit=1") return { ok: true, headers: { get: () => "v2:0" } };
+      if (url === "/conversations/chat-b/events?version=2") return sseResponse(options.signal).response;
+      if (url === "/conversations/chat-a/messages?after_seq=0&limit=500") return response([{ role: "user", content: "Chat A text", seq: 1 }]);
+      if (url === "/conversations/chat-b/messages?after_seq=0&limit=500") return response([{ role: "user", content: "Chat B text", seq: 1 }]);
+      if (url === "/conversations") { sidebarReads++; return response([]); }
+      throw new Error("Unexpected request: " + url);
+    }, { ...streamingGlobals, snapshotFetch: true });
+    t.after(() => { resolveLate?.({ ok: false, status: 404 }); client.run("newChat()"); });
+    await client.run("authorization = 'Basic test'; conversations = [{id:'chat-a',title:'Chat A'}, {id:'chat-b',title:'Chat B'}]");
+    await client.run("openConversation(conversations[0])");
+    await until(() => resolveLate);
+    client.element("message").value = "Draft for B";
+    await client.run("openConversation(conversations[1])");
+    client.element("message").value = "Draft for B";
+    assert.equal(client.run("conversation"), "chat-b");
+
+    resolveLate({ ok: false, status: 404 });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(client.run("conversation"), "chat-b");
+    assert.equal(client.run("stream.conversation"), "chat-b");
+    assert.match(visibleText(client.element("messages")), /Chat B text/);
+    assert.equal(client.element("chat-title").textContent, "Chat B");
+    assert.equal(client.element("message").value, "Draft for B");
+    assert.match(visibleText(client.element("conversations")), /Chat B/);
+    assert.notEqual(client.element("notice").textContent, "This chat was removed or is no longer available.");
+    assert.equal(sidebarReads, 0);
+  });
+}
 
 test("a failed refresh after a pushed message retries while the stream only sends heartbeats", async t => {
   let stream, historyReads = 0;

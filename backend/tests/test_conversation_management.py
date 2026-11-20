@@ -86,7 +86,10 @@ def test_delete_keeps_refund_and_blocks_pending_approval(client, demo_tickets):
     assert decide(client, proposal).status_code == 200
     assert client.delete(url).status_code == 409
     assert run_once()
+    execution_id = client.get(path).json()[0]["execution_id"]
+    assert client.get(f"/executions/{execution_id}").json()["result"] is not None
     assert client.delete(url).status_code == 204
+    assert client.get(f"/executions/{execution_id}").status_code == 404
     assert decide(client, proposal).status_code == 404
     with SessionLocal() as session:
         assert session.scalar(select(AppliedResolution)) is not None
