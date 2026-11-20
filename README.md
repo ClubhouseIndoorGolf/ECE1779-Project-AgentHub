@@ -143,6 +143,28 @@ Both list endpoints default to 100 records and accept `limit` from 1 to 500. Req
 
 System-generated defaults, validation errors, CLI prompts, logs and API descriptions are English. Source comments are bilingual. User-provided text remains Unicode and is stored as submitted.
 
+### Handle invalid input and request conflicts
+
+Conversation titles and message content containing a NUL character (`U+0000`) return `422` with the affected field in the validation detail. For a conflict when posting a message or deciding a proposal, the API returns `409` with an English `detail` and a stable `code`. For example, reusing a submission key with different text returns the following body.
+
+```json
+{
+  "detail": "submission_key already used for different content",
+  "code": "IDEMPOTENCY_CONFLICT"
+}
+```
+
+| Code | Condition |
+| --- | --- |
+| `IDEMPOTENCY_CONFLICT` | The submission key already belongs to a message with different content. |
+| `CONVERSATION_BUSY` | An active proposal or an earlier unfinished turn blocks the requested action. |
+| `PROPOSAL_EXPIRED` | The decision request found an expired proposal or an existing record of its expiration. |
+| `DECISION_CONFLICT` | A different decision is already saved for this proposal. |
+| `PROPOSAL_VERSION_CONFLICT` | The requested proposal version differs from the current version. |
+| `PROPOSAL_NOT_PENDING` | The proposal has left the approval stage and no expiration reason is available. |
+
+Retrying a submission with the same key and content returns its original receipt. Retrying the same proposal decision and version likewise returns the saved decision receipt. When a decision request closes an expired proposal, the API saves the invalidation and its events before returning `PROPOSAL_EXPIRED`.
+
 ### Read a saved refund result
 
 In fixed reply mode with [demo orders seeded](docs/WORKER_BASELINE.md#read-only-refund-check), send `Can order 1002 be refunded?`. After the worker replies, read the conversation history and call `GET /executions/{execution_id}` using the ID on the original user message. In this example, `outcome` is `INELIGIBLE`, `reason_codes` contains `WINDOW_EXPIRED`, and `result` is `null`.

@@ -85,6 +85,8 @@ The [read-only ticket lookup](WORKER_BASELINE.md#read-only-ticket-lookup) resolv
 
 For structured refund results, read `execution_id` from the source user message in history and call `GET /executions/{execution_id}` with the same account. A saved check can be `COMPLETED` with an empty `result`. Only a recorded simulated refund supplies an applied amount. [Developer guide](developer/EXECUTION_DETAILS.md) · [API example](../README.md#read-a-saved-refund-result) · [Manual verification](MANUAL_TESTING.md#mt21-read-saved-execution-details)
 
+Message submission and proposal decision conflicts return HTTP `409` with a stable `code` and the existing `detail`. Conversation titles and message content containing NUL return `422` before the request can write records. [Developer guide](developer/REQUEST_ERROR_CODES.md) · [API example](../README.md#handle-invalid-input-and-request-conflicts)
+
 For a fresh Codex chat, a useful starting prompt is:
 
 > Read AGENTS.md and docs/DEVELOPMENT_HANDOFF.md. Inspect the current branch, git status and recent main commits. Use the handoff to identify the relevant code and verification commands for this task: [describe the work]. Preserve the existing worker and browser guarantees unless the task changes them.

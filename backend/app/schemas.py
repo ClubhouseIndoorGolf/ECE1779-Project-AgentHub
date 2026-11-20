@@ -11,6 +11,19 @@ ExecutionStatus = Literal[
     "WAITING_FOR_APPROVAL", "QUEUED", "RUNNING", "COMPLETED", "REJECTED", "INVALIDATED", "FAILED"
 ]
 JobStatus = Literal["QUEUED", "RUNNING", "SUCCEEDED", "FAILED"]
+ConflictCode = Literal[
+    "IDEMPOTENCY_CONFLICT",
+    "CONVERSATION_BUSY",
+    "PROPOSAL_EXPIRED",
+    "DECISION_CONFLICT",
+    "PROPOSAL_VERSION_CONFLICT",
+    "PROPOSAL_NOT_PENDING",
+]
+
+
+class ConflictOut(BaseModel):
+    detail: str
+    code: ConflictCode
 
 
 # Reject unknown input fields and provide the English default title.
@@ -24,6 +37,8 @@ class ConversationCreate(BaseModel):
     @field_validator("title")
     @classmethod
     def check_title(cls, value):
+        if "\x00" in value:
+            raise ValueError("title must not contain NUL characters")
         if not value.strip():
             raise ValueError("title must not be blank")
         return value.strip()
@@ -66,6 +81,8 @@ class MessageCreate(BaseModel):
     @field_validator("content")
     @classmethod
     def check_content(cls, value):
+        if "\x00" in value:
+            raise ValueError("content must not contain NUL characters")
         if not value.strip():
             raise ValueError("content must not be blank")
         return value
