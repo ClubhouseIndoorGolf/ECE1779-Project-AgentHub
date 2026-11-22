@@ -563,6 +563,24 @@ function formatRefund(minor, currency) {
   return currency + " " + digits.slice(0, -2) + "." + digits.slice(-2);
 }
 
+// Plain-English explanations for saved proposal invalidation codes.
+// 已保存的方案失效原因代码对应的英文说明。
+const INVALIDATION_MESSAGES = {
+  PROPOSAL_EXPIRED: "The approval window ended before the refund could be applied.",
+  ORDER_CHANGED: "The order changed after the proposal was prepared, so it was not applied.",
+  POLICY_CHANGED: "The refund policy changed after the proposal was prepared, so it was not applied.",
+};
+const GENERIC_INVALIDATION = "The proposal is no longer valid, so it was not applied.";
+
+/** Explain why a proposal was invalidated; missing or unknown codes get a generic message.
+ * 说明方案失效的原因；原因缺失或无法识别时显示通用提示。
+ */
+function invalidationMessage(code) {
+  // Object.hasOwn keeps inherited names such as "constructor" from matching.
+  // Object.hasOwn 防止 "constructor" 等继承属性被误认为已知代码。
+  return code && Object.hasOwn(INVALIDATION_MESSAGES, code) ? INVALIDATION_MESSAGES[code] : GENERIC_INVALIDATION;
+}
+
 let detailRequest = 0;
 
 function closeExecutionDetail() {
@@ -584,11 +602,21 @@ async function openExecutionDetail(id) {
     const entries = [
       ["Order", detail.order_id],
       ["Eligibility", detail.outcome],
-      ["Reason", detail.reason_codes.join(", ")],
+      // These are the original eligibility codes, not the reason a proposal was later invalidated.
+      // 这些是最初的资格判断代码，并非方案之后失效的原因。
+      ["Eligibility reasons", detail.reason_codes.join(", ")],
       ["Workflow status", detail.status],
+      // Only the INVALIDATED status means invalidation; a verification time alone does not.
+      // 只有 INVALIDATED 状态才表示方案失效；仅有核验时间并不代表失效。
+      ["Proposal invalidated", detail.status === "INVALIDATED" ? invalidationMessage(detail.invalidation_reason) : null],
+      ["Verified at", detail.revalidated_at ? new Date(detail.revalidated_at).toLocaleString() : null],
       ["Decision", detail.decision?.decision],
       ["Continuation", detail.resume_job_status],
     ];
+    // An approved proposal can be invalidated even after its continuation succeeds, so only a
+    // saved result proves a refund. The amount comes from that result, not from the proposal.
+    // 已批准的方案即使后续任务成功也可能失效，因此只有已保存的 result 才能证明已退款；
+    // 金额取自 result，而不是方案中的金额。
     if (detail.result) entries.push(["Refund applied",
       formatRefund(detail.result.refund_amount_minor, detail.result.currency)]);
     for (const [name, value] of entries) {

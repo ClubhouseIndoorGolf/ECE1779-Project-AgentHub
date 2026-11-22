@@ -1082,6 +1082,105 @@ test("a rejected snapshot cursor is replaced and replayed duplicates are ignored
   assert.equal(client.run("stream.cursor"), "v2:9007199254740993");
 });
 
+/** Open the refund details dialog from a history row and read its fields as label/value pairs.
+ * 从历史消息打开退款详情弹窗，并以“标签/值”形式读取其中的字段。
+ */
+function executionDetailClient(detail) {
+  let reads = 0;
+  const client = createClient(async url => {
+    assert.equal(url, "/executions/ex-1");
+    reads++;
+    return response(typeof detail === "function" ? detail() : detail);
+  });
+  const dialog = client.element("execution-panel");
+  dialog.showModal = () => { dialog.open = true; };
+  dialog.close = () => { dialog.open = false; };
+  client.run("showMessages([{role:'user', content:'Refund', execution_id:'ex-1'}])");
+  const button = client.element("messages").children[0].children[2];
+  async function open() {
+    await button.listeners.get("click")();
+    const children = client.element("execution-fields").children;
+    const fields = new Map();
+    for (let i = 0; i < children.length; i += 2) fields.set(children[i].textContent, children[i + 1].textContent);
+    return fields;
+  }
+  return { client, dialog, open, reads: () => reads };
+}
+
+const ORDER_CHANGED_TEXT = "The order changed after the proposal was prepared, so it was not applied.";
+const GENERIC_INVALIDATION_TEXT = "The proposal is no longer valid, so it was not applied.";
+
+test("an approved proposal invalidated by an order change shows why and no applied refund", async () => {
+  const { dialog, open, reads } = executionDetailClient({
+    order_id: "1001", outcome: "ELIGIBLE", reason_codes: [], refund_amount_minor: "12999", currency: "CAD",
+    status: "INVALIDATED", invalidation_reason: "ORDER_CHANGED", revalidated_at: "2026-11-21T15:30:00Z",
+    decision: { decision: "APPROVE" }, resume_job_status: "SUCCEEDED", result: null,
+  });
+  const fields = await open();
+  assert.equal(fields.get("Workflow status"), "INVALIDATED");
+  assert.equal(fields.get("Proposal invalidated"), ORDER_CHANGED_TEXT);
+  assert.equal(fields.get("Verified at"), new Date("2026-11-21T15:30:00Z").toLocaleString());
+  // Approval and a successful continuation are shown, but they do not prove a refund.
+  // 显示审批与后续任务成功，但二者都不能证明已经退款。
+  assert.equal(fields.get("Decision"), "APPROVE");
+  assert.equal(fields.get("Continuation"), "SUCCEEDED");
+  assert.ok(!fields.has("Refund applied"));
+  assert.ok(![...fields.values()].some(value => value.includes("129.99")));
+
+  // Closing and reopening reads the saved record again and still shows the saved reason.
+  // 关闭后重新打开会再次读取已保存的记录，仍能看到已保存的失效原因。
+  dialog.close();
+  const reopened = await open();
+  assert.equal(reads(), 2);
+  assert.equal(reopened.get("Proposal invalidated"), ORDER_CHANGED_TEXT);
+  assert.ok(!reopened.has("Refund applied"));
+});
+
+for (const [name, audit] of [
+  ["a legacy record with null audit fields", { invalidation_reason: null, revalidated_at: null }],
+  ["a legacy record without audit fields", {}],
+  ["an unrecognized invalidation code", { invalidation_reason: "constructor", revalidated_at: null }],
+]) {
+  test(`${name} shows the generic invalidation message`, async () => {
+    const { open } = executionDetailClient({
+      order_id: "1001", outcome: "ELIGIBLE", reason_codes: [], status: "INVALIDATED",
+      decision: null, resume_job_status: null, result: null, ...audit,
+    });
+    const fields = await open();
+    assert.equal(fields.get("Proposal invalidated"), GENERIC_INVALIDATION_TEXT);
+    assert.ok(!fields.has("Verified at"));
+    assert.ok(!fields.has("Refund applied"));
+  });
+}
+
+test("a completed refund shows the applied result amount, and a verification time alone is not invalidation", async () => {
+  const { open } = executionDetailClient({
+    order_id: "1001", outcome: "ELIGIBLE", reason_codes: [], refund_amount_minor: "12999", currency: "CAD",
+    status: "COMPLETED", invalidation_reason: null, revalidated_at: "2026-11-21T15:30:00Z",
+    decision: { decision: "APPROVE" }, resume_job_status: "SUCCEEDED",
+    // The applied amount is read from the saved result, even when it differs from the proposal.
+    // 已退款金额取自已保存的 result，即使它与方案金额不同。
+    result: { refund_amount_minor: "9007199254740993", currency: "CAD" },
+  });
+  const fields = await open();
+  assert.equal(fields.get("Refund applied"), "CAD 90071992547409.93");
+  assert.ok(fields.has("Verified at"));
+  assert.ok(!fields.has("Proposal invalidated"));
+});
+
+test("eligibility codes are labelled as eligibility reasons, separate from invalidation", async () => {
+  const { open } = executionDetailClient({
+    order_id: "1002", outcome: "INELIGIBLE", reason_codes: ["WINDOW_EXPIRED"], status: "COMPLETED",
+    invalidation_reason: "ORDER_CHANGED", revalidated_at: null, decision: null, resume_job_status: null, result: null,
+  });
+  const fields = await open();
+  assert.equal(fields.get("Eligibility reasons"), "WINDOW_EXPIRED");
+  assert.ok(!fields.has("Reason"));
+  // A stray code on a non-invalidated execution is not presented as invalidation.
+  // 未失效的记录即使带有失效代码，也不会显示为方案失效。
+  assert.ok(!fields.has("Proposal invalidated"));
+});
+
 test("a saved execution opens from history and displays only an applied refund as paid", async () => {
   let applied = false;
   const client = createClient(async url => {
