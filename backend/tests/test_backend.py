@@ -18,7 +18,19 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from app.db import SessionLocal, engine
 from app.event_store import read_event_head, read_events
 from app.manage import save_user, seed_demo_orders
-from app.models import Base, Conversation, Execution, Job, Message, Order, ResolutionProposal, Ticket, User
+from app.models import (
+    Base,
+    Conversation,
+    ConversationEvent,
+    ConversationEventHead,
+    Execution,
+    Job,
+    Message,
+    Order,
+    ResolutionProposal,
+    Ticket,
+    User,
+)
 from app.refund_eligibility import evaluate_refund_eligibility, parse_refund_order_id
 from app.support_workflow import PrepareRefund, prepare_refund
 from app.ticket_lookup import parse_ticket_id
@@ -493,10 +505,14 @@ def test_demo_seed_preserves_saved_facts_and_rejects_reassignment(accounts):
 def test_english_defaults_preserve_unicode_input(client):
     created = client.post("/conversations", json={}).json()
     assert created["title"] == "New conversation"
-    conversation, _, _ = submit(client, content="你好，团队", conversation=created["id"])
+    titled = client.post("/conversations", json={"title": "  团队讨论 👋  "})
+    assert titled.status_code == 201
+    assert titled.json()["title"] == "团队讨论 👋"
+    content = " \t你好，团队 👋\n "
+    conversation, _, _ = submit(client, content=content, conversation=created["id"])
     assert run_once()
     messages = client.get(f"/conversations/{conversation}/messages").json()
-    assert messages[0]["content"] == "你好，团队"
+    assert messages[0]["content"] == content
     assert messages[1]["content"] == "Message received."
     schema = client.get("/openapi.json").json()
     assert (
@@ -513,11 +529,12 @@ def test_english_title_migration_preserves_existing_rows(client):
     command.downgrade(cfg, "0001_initial")
     with SessionLocal.begin() as session:
         owner = session.scalar(select(User).where(User.username == "alice"))
-        legacy = Conversation(user_id=owner.id)
-        session.add(legacy)
-        session.flush()
-        legacy_id = legacy.id
-        assert legacy.title == "新对话"
+        legacy_id = uuid4()
+        legacy_title = session.scalar(
+            text("INSERT INTO conversations (id, user_id) VALUES (:id, :owner) RETURNING title"),
+            {"id": legacy_id, "owner": owner.id},
+        )
+        assert legacy_title == "新对话"
     command.upgrade(cfg, "head")
     with SessionLocal.begin() as session:
         assert session.get(Conversation, original["id"]).title == "团队讨论"
@@ -532,12 +549,38 @@ def test_english_title_migration_preserves_existing_rows(client):
 def test_duplicate_submission_and_conflicting_content(client):
     conversation, payload, receipt = submit(client)
     url = f"/conversations/{conversation}/messages"
-    assert client.post(url, json=payload).json() == receipt
-    assert client.post(url, json={**payload, "content": "different"}).status_code == 409
+    retry = client.post(url, json=payload)
+    assert retry.status_code == 202 and retry.json() == receipt
+    conflict = client.post(url, json={**payload, "content": "different"})
+    assert conflict.status_code == 409
+    assert conflict.json() == {
+        "detail": "submission_key already used for different content",
+        "code": "IDEMPOTENCY_CONFLICT",
+    }
     with SessionLocal() as session:
         assert session.scalar(select(func.count()).select_from(Job)) == 1
         assert session.scalar(select(func.count()).select_from(Message)) == 1
         assert session.get(Conversation, conversation).next_message_seq == 2
+        assert read_event_head(session, UUID(conversation)) == 2
+
+
+def test_openapi_describes_both_conflict_responses(client):
+    schema = client.get("/openapi.json").json()
+    for path in ("/conversations/{conversation_id}/messages", "/proposals/{proposal_id}/decision"):
+        response = schema["paths"][path]["post"]["responses"]["409"]
+        assert response["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/ConflictOut"
+        }
+    conflict = schema["components"]["schemas"]["ConflictOut"]
+    assert set(conflict["required"]) == {"detail", "code"}
+    assert set(conflict["properties"]["code"]["enum"]) == {
+        "IDEMPOTENCY_CONFLICT",
+        "CONVERSATION_BUSY",
+        "PROPOSAL_EXPIRED",
+        "DECISION_CONFLICT",
+        "PROPOSAL_VERSION_CONFLICT",
+        "PROPOSAL_NOT_PENDING",
+    }
 
 
 def test_concurrent_duplicate_requests_create_one_job(client):
@@ -567,6 +610,32 @@ def test_blank_content_rejected(client, content):
         f"/conversations/{conversation}/messages", json={"content": content, "submission_key": str(uuid4())}
     )
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize("field", ["title", "content"])
+def test_nul_input_is_rejected_without_writes(client, field):
+    conversation_id = None
+    path = "/conversations"
+    payload = {field: "你好\x00👋"}
+    if field == "content":
+        conversation_id = UUID(client.post(path, json={}).json()["id"])
+        path = f"/conversations/{conversation_id}/messages"
+        payload["submission_key"] = str(uuid4())
+
+    response = client.post(path, json=payload)
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert error["loc"] == ["body", field]
+    assert error["msg"] == f"Value error, {field} must not contain NUL characters"
+    with SessionLocal() as session:
+        expected_conversations = int(conversation_id is not None)
+        for model in (Conversation, ConversationEventHead):
+            assert session.scalar(select(func.count()).select_from(model)) == expected_conversations
+        for model in (Message, Job, ConversationEvent):
+            assert session.scalar(select(func.count()).select_from(model)) == 0
+        if conversation_id is not None:
+            assert session.get(Conversation, conversation_id).next_message_seq == 1
+            assert read_event_head(session, conversation_id) == 0
 
 
 def test_message_and_job_rollback_together(client):

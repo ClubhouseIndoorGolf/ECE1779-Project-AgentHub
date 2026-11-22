@@ -11,6 +11,7 @@ from app.event_store import EventToAppend, append_events, message_created_event
 from app.models import (
     AppliedResolution,
     Conversation,
+    ConversationEvent,
     Execution,
     Job,
     Message,
@@ -61,10 +62,14 @@ def invalidate_proposal(
     proposal_id: UUID,
     reason: str,
     reply: str,
+    *,
+    audit_reason: str | None = None,
 ) -> list[EventToAppend]:
     """Stage an invalidation and describe the outcome and the reply in causal order.
     暂存方案失效状态，并按发生顺序描述结果和回复。
     """
+    execution.invalidation_reason = audit_reason or ("PROPOSAL_EXPIRED" if reason == "EXPIRED" else reason)
+    execution.revalidated_at = session.scalar(select(func.clock_timestamp()))
     message = close_proposal(session, conversation, execution, "INVALIDATED", reply)
     return [
         EventToAppend(
@@ -75,10 +80,28 @@ def invalidate_proposal(
                 "source_message_id": str(execution.source_message_id),
                 "status": "INVALIDATED",
                 "reason": reason,
+                "invalidation_reason": execution.invalidation_reason,
+                "revalidated_at": execution.revalidated_at.isoformat(),
             },
         ),
         message_created_event(message),
     ]
+
+
+def read_invalidation_reason(session: Session, conversation_id: UUID, proposal_id: UUID) -> str | None:
+    """Read the saved reason for a proposal in an already authorized conversation.
+    读取已通过归属校验的会话中该方案的失效原因。
+    """
+    return session.scalar(
+        select(ConversationEvent.payload["reason"].astext)
+        .where(
+            ConversationEvent.conversation_id == conversation_id,
+            ConversationEvent.event_type == "resolution.invalidated",
+            ConversationEvent.payload["proposal_id"].astext == str(proposal_id),
+        )
+        .order_by(ConversationEvent.seq.desc())
+        .limit(1)
+    )
 
 
 def active_resolution_exists(session: Session, conversation_id: UUID) -> bool:
@@ -198,20 +221,29 @@ def apply_approved_resolution(session: Session, job: Job, conversation: Conversa
             AppliedResolution.order_id == execution.requested_order_id
         )
     )
+    execution.revalidated_at = now
     if now >= proposal.expires_at:
         return invalidate_proposal(session, conversation, execution, proposal.id, "EXPIRED", EXPIRED_REPLY)
-    if (
-        order is None
-        or ticket is None
-        or decision.user_id != conversation.user_id
+    reason = None
+    if order is None or ticket is None:
+        reason = "FACTS_UNAVAILABLE"
+    elif (
+        decision.user_id != conversation.user_id
         or order.assigned_user_id != conversation.user_id
         or ticket.assigned_user_id != conversation.user_id
-        or ticket.order_id != order.id
-        or ticket.status != "OPEN"
-        or existing_refund is not None
-        or execution.policy_version != POLICY_VERSION
-        or order_facts(order) != proposal.expected_order_facts
     ):
+        reason = "OWNERSHIP_CHANGED"
+    elif ticket.order_id != order.id:
+        reason = "TICKET_ORDER_CHANGED"
+    elif ticket.status != "OPEN":
+        reason = "TICKET_CLOSED"
+    elif existing_refund is not None:
+        reason = "ALREADY_REFUNDED"
+    elif execution.policy_version != POLICY_VERSION:
+        reason = "POLICY_CHANGED"
+    elif order_facts(order) != proposal.expected_order_facts:
+        reason = "ORDER_CHANGED"
+    if reason:
         return invalidate_proposal(
             session,
             conversation,
@@ -219,6 +251,7 @@ def apply_approved_resolution(session: Session, job: Job, conversation: Conversa
             proposal.id,
             "BUSINESS_STATE_CHANGED",
             "The refund proposal no longer matches the ticket or order. Request a new proposal.",
+            audit_reason=reason,
         )
 
     # Recalculate the amount at application time using the current policy and locked facts.

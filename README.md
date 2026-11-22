@@ -1,6 +1,6 @@
 # AgentHub Backend
 
-AgentHub is a University of Toronto ECE1779 team project. This repository implements authenticated conversations, durable message submission, PostgreSQL-backed jobs, and a separate worker with optional OpenAI text chat. The default fixed-reply mode requires no API key and makes no paid model requests.
+AgentHub is a University of Toronto ECE1779 team project. This repository implements authenticated conversations, durable message submission, PostgreSQL-backed jobs, and a separate worker with optional OpenAI tool selection and chat. The default fixed-reply mode requires no API key and makes no paid model requests.
 
 For a fresh checkout or Codex session, start with the [development handoff](docs/DEVELOPMENT_HANDOFF.md).
 
@@ -142,6 +142,28 @@ Generate a UUID with `[guid]::NewGuid()` in PowerShell or `python -c "import uui
 Both list endpoints default to 100 records and accept `limit` from 1 to 500. Requests for another account's resource return `404`; missing or invalid credentials return `401`; invalid input returns `422`; database unavailability returns `503`.
 
 System-generated defaults, validation errors, CLI prompts, logs and API descriptions are English. Source comments are bilingual. User-provided text remains Unicode and is stored as submitted.
+
+### Handle invalid input and request conflicts
+
+Conversation titles and message content containing a NUL character (`U+0000`) return `422` with the affected field in the validation detail. For a conflict when posting a message or deciding a proposal, the API returns `409` with an English `detail` and a stable `code`. For example, reusing a submission key with different text returns the following body.
+
+```json
+{
+  "detail": "submission_key already used for different content",
+  "code": "IDEMPOTENCY_CONFLICT"
+}
+```
+
+| Code | Condition |
+| --- | --- |
+| `IDEMPOTENCY_CONFLICT` | The submission key already belongs to a message with different content. |
+| `CONVERSATION_BUSY` | An active proposal or an earlier unfinished turn blocks the requested action. |
+| `PROPOSAL_EXPIRED` | The decision request found an expired proposal or an existing record of its expiration. |
+| `DECISION_CONFLICT` | A different decision is already saved for this proposal. |
+| `PROPOSAL_VERSION_CONFLICT` | The requested proposal version differs from the current version. |
+| `PROPOSAL_NOT_PENDING` | The proposal has left the approval stage and no expiration reason is available. |
+
+Retrying a submission with the same key and content returns its original receipt. Retrying the same proposal decision and version likewise returns the saved decision receipt. When a decision request closes an expired proposal, the API saves the invalidation and its events before returning `PROPOSAL_EXPIRED`.
 
 ### Read a saved refund result
 

@@ -6,6 +6,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.activity import read_activity
 from app.event_store import read_event_head
 from app.models import (
     AppliedResolution,
@@ -17,7 +18,14 @@ from app.models import (
     ResolutionProposal,
 )
 from app.resolution_workflow import PROPOSAL_VERSION
-from app.schemas import AppliedResolutionOut, ExecutionDetailOut, MessageOut, ProposalDecisionOut, ProposalOut
+from app.schemas import (
+    ActivityOut,
+    AppliedResolutionOut,
+    ExecutionDetailOut,
+    MessageOut,
+    ProposalDecisionOut,
+    ProposalOut,
+)
 
 
 def _history_query(conversation_id: UUID):
@@ -65,6 +73,8 @@ def proposal_out(execution, proposal, decision, job) -> ProposalOut:
         decision=decision.decision if decision else None,
         decided_at=decision.decided_at if decision else None,
         resume_job_id=decision.resume_job_id if decision else None,
+        revalidated_at=execution.revalidated_at,
+        invalidation_reason=execution.invalidation_reason,
     )
 
 
@@ -74,10 +84,13 @@ def read_history(session: Session, conversation_id: UUID, after_seq: int, limit:
     """
     rows = session.execute(
         _history_query(conversation_id).where(Message.seq > after_seq).order_by(Message.seq).limit(limit)
-    )
+    ).all()
+    activity = read_activity(session, [message.id for message, *_ in rows if message.role == "user"])
     history = []
     for message, execution, proposal, decision, job in rows:
         result = MessageOut.model_validate(message)
+        if message.id in activity:
+            result.activity = ActivityOut.model_validate(activity[message.id])
         # Attach saved execution IDs to their source user messages.
         # 将已保存的执行记录编号附在对应的用户消息上。
         if message.role == "user" and execution is not None:
@@ -125,7 +138,12 @@ def read_execution_detail(session: Session, execution_id: UUID, user_id: UUID) -
         .outerjoin(ProposalDecision, ProposalDecision.proposal_id == ResolutionProposal.id)
         .outerjoin(Job, Job.id == ProposalDecision.resume_job_id)
         .outerjoin(AppliedResolution, AppliedResolution.proposal_id == ProposalDecision.proposal_id)
-        .where(Execution.id == execution_id, Message.role == "user", Conversation.user_id == user_id)
+        .where(
+            Execution.id == execution_id,
+            Message.role == "user",
+            Conversation.user_id == user_id,
+            Conversation.deleted_at.is_(None),
+        )
     ).one_or_none()
     if row is None:
         return None

@@ -5,12 +5,25 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 ExecutionStatus = Literal[
     "WAITING_FOR_APPROVAL", "QUEUED", "RUNNING", "COMPLETED", "REJECTED", "INVALIDATED", "FAILED"
 ]
 JobStatus = Literal["QUEUED", "RUNNING", "SUCCEEDED", "FAILED"]
+ConflictCode = Literal[
+    "IDEMPOTENCY_CONFLICT",
+    "CONVERSATION_BUSY",
+    "PROPOSAL_EXPIRED",
+    "DECISION_CONFLICT",
+    "PROPOSAL_VERSION_CONFLICT",
+    "PROPOSAL_NOT_PENDING",
+]
+
+
+class ConflictOut(BaseModel):
+    detail: str
+    code: ConflictCode
 
 
 # Reject unknown input fields and provide the English default title.
@@ -24,6 +37,8 @@ class ConversationCreate(BaseModel):
     @field_validator("title")
     @classmethod
     def check_title(cls, value):
+        if "\x00" in value:
+            raise ValueError("title must not contain NUL characters")
         if not value.strip():
             raise ValueError("title must not be blank")
         return value.strip()
@@ -31,10 +46,25 @@ class ConversationCreate(BaseModel):
 
 # Expose conversation metadata without internal sequence-allocation fields.
 # 返回会话资料，不公开内部顺序号分配字段。
+class ConversationUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    is_pinned: bool | None = Field(default=None, strict=True)
+
+    @model_validator(mode="after")
+    def validate_update(self):
+        if not self.model_fields_set or any(getattr(self, key) is None for key in self.model_fields_set):
+            raise ValueError("Provide a title or pin state; null values are not supported")
+        if self.title is not None:
+            self.title = ConversationCreate.check_title(self.title)
+        return self
+
+
 class ConversationOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
     title: str
+    is_pinned: bool
     created_at: datetime
     updated_at: datetime
 
@@ -51,6 +81,8 @@ class MessageCreate(BaseModel):
     @field_validator("content")
     @classmethod
     def check_content(cls, value):
+        if "\x00" in value:
+            raise ValueError("content must not contain NUL characters")
         if not value.strip():
             raise ValueError("content must not be blank")
         return value
@@ -77,6 +109,8 @@ class ProposalOut(BaseModel):
     decision: Literal["APPROVE", "REJECT"] | None = None
     decided_at: datetime | None = None
     resume_job_id: UUID | None = None
+    revalidated_at: datetime | None = None
+    invalidation_reason: str | None = None
 
 
 # Only the authenticated employee can supply a decision on the identified version.
@@ -130,6 +164,20 @@ class ExecutionDetailOut(BaseModel):
 
 # Return saved chat text and its relationship to the originating request.
 # 返回已保存的聊天文本，以及与原始请求的关联。
+class ActivityStepOut(BaseModel):
+    seq: int
+    name: str
+    status: Literal["running", "completed"]
+    text: str
+
+
+class ActivityOut(BaseModel):
+    job_id: UUID
+    status: Literal["QUEUED", "RUNNING", "SUCCEEDED", "FAILED"]
+    attempts: int
+    steps: list[ActivityStepOut]
+
+
 class MessageOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
@@ -141,6 +189,7 @@ class MessageOut(BaseModel):
     created_at: datetime
     execution_id: UUID | None = None
     proposal: ProposalOut | None = None
+    activity: ActivityOut | None = None
 
 
 # Return stable identifiers for both a new submission and its retries.
@@ -159,6 +208,19 @@ class JobOut(BaseModel):
     status: JobStatus
     attempts: int
     last_error: str | None
+    created_at: datetime
+    finished_at: datetime | None
+
+
+class AgentStepOut(BaseModel):
+    """Account-scoped durable progress; worker tokens and raw provider responses stay private.
+    按账号授权的持久进度，不公开 worker 令牌或提供商原始响应。
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+    seq: int
+    name: str
+    result: dict | None
     created_at: datetime
     finished_at: datetime | None
 

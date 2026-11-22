@@ -48,7 +48,7 @@ AgentHub is a University of Toronto ECE1779 team project for small-business supp
 | API | [main.py](../backend/app/main.py) and [schemas.py](../backend/app/schemas.py). Authenticate and scope access, accept messages, and expose saved conversations, job status and refund execution details. |
 | PostgreSQL | [models.py](../backend/app/models.py) and [Alembic revisions](../backend/migrations/versions/). Store users, conversations, messages, jobs, demo orders and eligibility results. |
 | Independent worker | [worker.py](../backend/app/worker.py). Claim jobs, renew leases, retry transient failures and commit replies. |
-| Reply providers | [replies.py](../backend/app/replies.py). Fixed acknowledgements or optional OpenAI text generation. |
+| Reply providers | [replies.py](../backend/app/replies.py). Fixed commands or optional OpenAI tool selection and replies; see [execution contract](AGENT_EXECUTION.md). |
 | Runtime and CI | [Compose](../compose.yaml) runs API, worker, PostgreSQL, migration and bootstrap services. [GitHub Actions](../.github/workflows/ci.yml) tests the project. |
 
 A message submission saves the user message and queues its job atomically. Retrying the same content with the same `submission_key` in that conversation returns the existing receipt. The worker claims ready jobs with PostgreSQL row locks and skips rows held by another worker. It processes turns in order within a conversation while allowing different conversations to run in parallel. During model calls it renews its lease in a separate transaction. Completion checks the current lease token and saves the assistant reply and success state together. Expired work can be reclaimed, and stale workers cannot commit replies. See the [database reference](BACKEND_DATABASE.md) and [worker guide](WORKER_BASELINE.md) for details.
@@ -84,6 +84,8 @@ The [read-only refund check](WORKER_BASELINE.md#read-only-refund-check) evaluate
 The [read-only ticket lookup](WORKER_BASELINE.md#read-only-ticket-lookup) resolves a ticket and its linked order for the signed-in account. Fixed mode can [prepare a refund proposal](WORKER_BASELINE.md#prepare-a-refund-proposal) and [apply a simulated resolution after explicit approval](WORKER_BASELINE.md#approve-or-reject-a-refund-proposal). [Live updates](LIVE_UPDATES.md) stream conversation changes over SSE. Cloud orchestration, deployment monitoring and automated backups remain planned. The [original architecture handover](AGENTHUB_TEAM_HANDOVER.md) explains the rationale and alternatives. Its React and cloud diagrams describe proposals. Use current code and team decisions to resolve differences.
 
 For structured refund results, read `execution_id` from the source user message in history and call `GET /executions/{execution_id}` with the same account. A saved check can be `COMPLETED` with an empty `result`. Only a recorded simulated refund supplies an applied amount. [Developer guide](developer/EXECUTION_DETAILS.md) · [API example](../README.md#read-a-saved-refund-result) · [Manual verification](MANUAL_TESTING.md#mt21-read-saved-execution-details)
+
+Message submission and proposal decision conflicts return HTTP `409` with a stable `code` and the existing `detail`. Conversation titles and message content containing NUL return `422` before the request can write records. [Developer guide](developer/REQUEST_ERROR_CODES.md) · [API example](../README.md#handle-invalid-input-and-request-conflicts)
 
 For a fresh Codex chat, a useful starting prompt is:
 
