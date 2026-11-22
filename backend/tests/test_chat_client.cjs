@@ -373,7 +373,7 @@ test("signing out clears drafts and pending submissions before another account s
 /** Exercise a delayed initial history read after a full send-and-reply workflow finishes.
  * 在完整发送和回复流程结束后再返回初始历史请求，验证旧响应不会覆盖新结果。
  */
-async function delayedHistory({ reject = false, fullPage = false } = {}) {
+async function delayedHistory({ reject = false, missing = false, fullPage = false } = {}) {
   let resolveOld, rejectOld;
   const oldResponse = new Promise((resolve, reject) => { resolveOld = resolve; rejectOld = reject; });
   let historyReads = 0;
@@ -401,8 +401,10 @@ async function delayedHistory({ reject = false, fullPage = false } = {}) {
   // A stale failure must also be ignored; a stale full page must not trigger more pages.
   // 旧请求失败也应被忽略；旧请求返回满页数据时，也不能继续发起后续分页读取。
   if (reject) rejectOld(new TypeError("Late history failure"));
+  else if (missing) resolveOld({ ok: false, status: 404 });
   else resolveOld(response(fullPage ? Array.from({ length: 500 }, () => user) : []));
   await opening;
+  assert.equal(client.run("conversation"), "chat-a");
   assert.equal(client.element("messages").children.length, 2);
   assert.equal(client.element("messages").children[1].children[1].textContent, assistant.content);
   assert.equal(historyReads, 3);
@@ -410,6 +412,7 @@ async function delayedHistory({ reject = false, fullPage = false } = {}) {
 
 test("old history cannot overwrite a newly saved reply", () => delayedHistory());
 test("old history failures do not replace a newer successful state", () => delayedHistory({ reject: true }));
+test("an obsolete history 404 does not clear the active chat", () => delayedHistory({ missing: true }));
 test("superseded history does not fetch additional stale pages", () => delayedHistory({ fullPage: true }));
 
 test("saved proposal restores after a new page loads the same chat", async () => {
@@ -627,6 +630,76 @@ test("a dropped stream reconnects with the last complete durable event ID", asyn
   client.run("newChat()");
 });
 
+test("a history 404 clears a removed chat and refreshes the sidebar without SSE", async () => {
+  let sidebarReads = 0;
+  const client = createClient(async url => {
+    if (url.startsWith("/conversations/chat-a/messages?")) return { ok: false, status: 404 };
+    if (url === "/conversations") {
+      sidebarReads++;
+      return response([{ id: "chat-b", title: "Other chat" }]);
+    }
+    throw new Error("Unexpected request: " + url);
+  });
+  client.run(`authorization = 'Basic test';
+    conversations = [{ id: 'chat-a', title: 'Removed chat' }];
+    drafts.set('chat-a', { content: 'Old draft', pending: { submission_key: 'old-key' } });
+    drafts.set('chat-b', { content: 'Other draft' });
+    drawConversations();`);
+  await client.element("conversations").children[0].children[0].listeners.get("click")();
+  assert.equal(client.run("conversation"), null);
+  assert.equal(client.run("pending"), null);
+  assert.equal(client.run("drafts.has('chat-a')"), false);
+  assert.equal(client.run("drafts.has('chat-b')"), true);
+  assert.equal(client.element("message").value, "");
+  assert.equal(client.element("message").disabled, false);
+  assert.equal(client.element("chat-title").textContent, "New chat");
+  assert.equal(client.element("messages").children.length, 0);
+  assert.match(client.element("notice").textContent, /chat was removed/);
+  assert.equal(sidebarReads, 1);
+  await until(() => visibleText(client.element("conversations")).includes("Other chat"));
+  assert.doesNotMatch(visibleText(client.element("conversations")), /Removed chat/);
+});
+
+// Same history 404 while the SSE v2 stream is starting: the chat is retired and its stream closed for good.
+// 同样的历史 404，但 SSE v2 事件流正在建立：会话被清理，事件流被关闭且不再重连。
+test("a history 404 with the v2 stream starting clears the chat and closes its stream", async t => {
+  let sidebarReads = 0;
+  const opened = [];
+  const client = createClient(async (url, options) => {
+    if (url === "/conversations/chat-a/messages?after_seq=0&limit=500") return { ok: false, status: 404 };
+    if (url === "/conversations/chat-a/events?version=2") { opened.push(options.signal); return sseResponse(options.signal).response; }
+    if (url === "/conversations") {
+      sidebarReads++;
+      return response([{ id: "chat-b", title: "Other chat" }]);
+    }
+    throw new Error("Unexpected request: " + url);
+  }, streamingGlobals);
+  t.after(() => client.run("newChat()"));
+  client.run(`authorization = 'Basic test';
+    conversations = [{ id: 'chat-a', title: 'Removed chat' }];
+    drafts.set('chat-a', { content: 'Old draft', pending: { submission_key: 'old-key' } });
+    drafts.set('chat-b', { content: 'Other draft' });
+    drawConversations();`);
+  await client.element("conversations").children[0].children[0].listeners.get("click")();
+  assert.equal(client.run("conversation"), null);
+  assert.equal(client.run("pending"), null);
+  assert.equal(client.run("drafts.has('chat-a')"), false);
+  assert.equal(client.run("drafts.has('chat-b')"), true);
+  assert.equal(client.element("message").disabled, false);
+  assert.equal(client.element("chat-title").textContent, "New chat");
+  assert.equal(client.element("messages").children.length, 0);
+  assert.match(client.element("notice").textContent, /chat was removed/);
+  assert.equal(client.run("stream"), null);
+  await until(() => visibleText(client.element("conversations")).includes("Other chat"));
+  assert.doesNotMatch(visibleText(client.element("conversations")), /Removed chat/);
+  // Any stream request that started was aborted, and none reopens after the reconnect delay.
+  // 已发出的事件流请求都被中止，等过重连间隔后也不会重新打开。
+  await new Promise(resolve => setTimeout(resolve, 400));
+  assert.ok(opened.length <= 1);
+  assert.ok(opened.every(signal => signal.aborted));
+  assert.equal(sidebarReads, 1);
+});
+
 test("a missing conversation stream clears the chat without retrying", async t => {
   let opens = 0;
   const client = createClient(async url => {
@@ -755,7 +828,7 @@ test("a snapshot 404 after history renders clears the removed chat without openi
 
 // A late 404 for a chat the user already left must not clear the chat opened since.
 // 用户已离开的会话迟到返回 404 时，不能清除之后打开的会话。
-for (const stage of ["snapshot", "stream"]) {
+for (const stage of ["history", "snapshot", "stream"]) {
   test(`a late ${stage} 404 from a previous chat leaves the newly opened chat intact`, async t => {
     let resolveLate, sidebarReads = 0;
     const held = () => new Promise(resolve => { resolveLate = resolve; });
@@ -763,17 +836,24 @@ for (const stage of ["snapshot", "stream"]) {
       if (url === "/conversations/chat-a/messages?after_seq=0&limit=1") {
         return stage === "snapshot" ? held() : { ok: true, headers: { get: () => "v2:0" } };
       }
-      if (url === "/conversations/chat-a/events?version=2") return held();
+      if (url === "/conversations/chat-a/events?version=2") {
+        return stage === "stream" ? held() : sseResponse(options.signal).response;
+      }
       if (url === "/conversations/chat-b/messages?after_seq=0&limit=1") return { ok: true, headers: { get: () => "v2:0" } };
       if (url === "/conversations/chat-b/events?version=2") return sseResponse(options.signal).response;
-      if (url === "/conversations/chat-a/messages?after_seq=0&limit=500") return response([{ role: "user", content: "Chat A text", seq: 1 }]);
+      if (url === "/conversations/chat-a/messages?after_seq=0&limit=500") {
+        return stage === "history" ? held() : response([{ role: "user", content: "Chat A text", seq: 1 }]);
+      }
       if (url === "/conversations/chat-b/messages?after_seq=0&limit=500") return response([{ role: "user", content: "Chat B text", seq: 1 }]);
       if (url === "/conversations") { sidebarReads++; return response([]); }
       throw new Error("Unexpected request: " + url);
     }, { ...streamingGlobals, snapshotFetch: true });
     t.after(() => { resolveLate?.({ ok: false, status: 404 }); client.run("newChat()"); });
     await client.run("authorization = 'Basic test'; conversations = [{id:'chat-a',title:'Chat A'}, {id:'chat-b',title:'Chat B'}]");
-    await client.run("openConversation(conversations[0])");
+    // A held history read keeps openConversation pending, so only await it for the other stages.
+    // 历史请求被挂起时 openConversation 不会结束，因此只在其他阶段等待它完成。
+    const opening = client.run("openConversation(conversations[0])");
+    if (stage !== "history") await opening;
     await until(() => resolveLate);
     client.element("message").value = "Draft for B";
     await client.run("openConversation(conversations[1])");
@@ -781,6 +861,7 @@ for (const stage of ["snapshot", "stream"]) {
     assert.equal(client.run("conversation"), "chat-b");
 
     resolveLate({ ok: false, status: 404 });
+    if (stage === "history") await opening;
     await new Promise(resolve => setTimeout(resolve, 100));
     assert.equal(client.run("conversation"), "chat-b");
     assert.equal(client.run("stream.conversation"), "chat-b");

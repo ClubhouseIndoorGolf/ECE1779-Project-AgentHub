@@ -10,8 +10,9 @@ Chinese-language explanations for the team are grouped under `zh-CN/`. Reviewers
 | [Chinese manual testing guide](zh-CN/MANUAL_TESTING.md) | Manual cases and result records aligned with the English reviewer guide |
 | [Read-only refund eligibility implementation guide](zh-CN/AGENTHUB_READ_ONLY_REFUND_CHECK.md) | Order data, worker integration, result persistence and acceptance cases |
 | [Refund execution details](EXECUTION_DETAILS.md) | History lookup, ownership, approval and refund status, and local verification |
+| [Chat request validation and conflict responses](REQUEST_ERROR_CODES.md) | NUL validation, public error codes, retry order, and expiration transactions |
 | [Durable SSE replay development plan](zh-CN/AGENTHUB_DURABLE_SSE_REPLAY_PLAN.md) | Approval and execution events, cursor compatibility, implementation order and acceptance tests |
-| [Application and data backend backlog](zh-CN/AGENTHUB_APPLICATION_DATA_BACKLOG.md) | Jinxi Hu's remaining backend work, acceptance criteria and integration responsibilities |
+| [Application and data backend follow-up plan](zh-CN/AGENTHUB_APPLICATION_DATA_BACKLOG.md) | Jinxi Hu's browser and cloud acceptance tasks, optional API work, and completed backend scope |
 | [Overall backend plan](zh-CN/AGENTHUB_BACKEND_PLAN.md) | Full proposed backend scope, including future cloud and business capabilities |
 | [Initial development plan](zh-CN/AGENTHUB_BACKEND_INITIAL_DEVELOPMENT_PLAN.md) | The first development milestone and its acceptance criteria |
 | [Initial database design](zh-CN/AGENTHUB_BACKEND_INITIAL_DATABASE_DESIGN.md) | Detailed explanation of the four initial tables |

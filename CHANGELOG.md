@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### 2026-11-19
+
+- **Chat request validation and conflict codes.** Conversation titles and message content containing NUL return `422` before writes. Message submission and proposal decision conflicts return a stable top-level `code` with their existing HTTP `409` and English `detail`. Identical retries return their original receipts. Expiration detected during approval commits the invalidation and its events before returning the conflict. [Developer guide](docs/developer/REQUEST_ERROR_CODES.md)
+- **Local verification** (`c7d4224`). Passed 132 backend tests on isolated PostgreSQL, 20 offline client tests, Ruff lint and format checks, and fixed-mode Compose API and worker smoke checks. The regression tests cover rollback when expiration events cannot be saved.
+
 ### 2026-11-18
 
 - **Saved refund execution details.** History exposes `execution_id` on the source message of a saved refund check. `GET /executions/{execution_id}` returns the saved eligibility, approval receipt, continuation status, and applied refund for the owning account. Order numbers and amounts in minor units are decimal strings. The history pagination and SSE v2 cursor contracts remain compatible with existing clients. [API example](README.md#read-a-saved-refund-result) · [Verification procedure](docs/MANUAL_TESTING.md#mt21-read-saved-execution-details)

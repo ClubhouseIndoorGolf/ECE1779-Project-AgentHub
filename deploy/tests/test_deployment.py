@@ -127,7 +127,7 @@ def fake_docker(args):
             output = json.dumps({
                 "Name": stack + "_db", "Labels": {"com.docker.stack.namespace": stack},
                 "TaskTemplate": {"ContainerSpec": {
-                    "Image": "postgres:16" if fault == "changed-database" else os.environ["POSTGRES_IMAGE"],
+                    "Image": "postgres:16" if fault == "changed-database" else state.get("db_image", os.environ["POSTGRES_IMAGE"]),
                     "Env": ["POSTGRES_DB=" + os.environ["POSTGRES_DB"], "POSTGRES_USER=" + os.environ["POSTGRES_USER"]],
                     "Mounts": [{"Type": "bind", "Source": os.environ["POSTGRES_DATA_PATH"], "Target": "/var/lib/postgresql/data"}],
                     "Secrets": [{"SecretName": os.environ["DB_PASSWORD_SECRET"]}],
@@ -135,24 +135,28 @@ def fake_docker(args):
             })
         elif "Replicas" in fmt:
             output = "1" if fault == "armed-setup" or state.get("setup") else "0"
+            if fault == "failed-replica-inspection":
+                code = 1
         elif "RestartPolicy" in fmt:
-            output = "none"
+            output = "on-failure" if fault == "retry-enabled" else "none"
+            if fault == "failed-restart-inspection":
+                code = 1
         elif "UpdateStatus" in fmt:
-            output = "paused" if fault == "paused-db" else "completed"
+            output = state.get("update", "paused" if fault == "paused-db" else "completed")
         else:
             code = 90
     elif args[:2] == ["service", "ps"]:
         service = args[-1].removeprefix(stack + "_")
         if service == "setup":
             output = "old-setup"
-            if state.get("launched"):
+            if state.get("launched") and fault != "historical-only":
                 output += "\nnew-setup"
-                if fault == "duplicate-setup":
+                if fault == "duplicate-setup" or (fault == "late-duplicate" and not state["setup"]):
                     output += "\nextra-setup"
         elif service == "db":
             output = "db-1"
         elif service in ("api", "worker"):
-            output = f"{service}-1\n{service}-2" if state.get("apps") else ""
+            output = state.get("task_list", f"{service}-1\n{service}-2") if state.get("apps") else ""
         else:
             code = 90
     elif args[:2] == ["stack", "deploy"]:
@@ -175,7 +179,8 @@ def fake_docker(args):
             if "ContainerStatus.ExitCode" in fmt:
                 value = "7" if fault == "nonzero-setup" else "0"
             elif "|" in fmt:
-                value = f"manager|running|container-{task}"
+                node = "worker" if os.environ.get("TWO_NODES") and task.endswith("-1") and task != "db-1" else "manager"
+                value = f"{node}|running|container-{task}"
             elif fmt == "{{.NodeID}}":
                 value = "manager"
             else:
@@ -185,9 +190,20 @@ def fake_docker(args):
             values.append(value)
         output = "\n".join(values)
     elif args[0] == "inspect" and "State.Health" in fmt:
-        output = "unhealthy" if fault == "unhealthy-db" else "healthy"
+        health = "unhealthy" if fault in ("unhealthy-db", "unhealthy-worker") else "healthy"
+        output = f"running|{health}" if ".State.Status" in fmt else health
+        if os.environ.get("TWO_NODES") and args[-1].startswith(("container-api-", "container-worker-")):
+            expected_node = "worker" if args[-1].endswith("-1") else "manager"
+            if os.environ.get("FAKE_NODE", "manager") != expected_node:
+                code = 90
     else:
         code = 90
+    # A failed query may still produce stdout. A retry must discard that result.
+    # 查询失败时仍可能写入标准输出；重试时必须丢弃该结果。
+    if args[:2] + [args[-1]] == state.get("fail_query"):
+        if state.get("permanent") or not state.get("query_failed"):
+            state["query_failed"] = True
+            code = 1
     state_path.write_text(json.dumps(state))
     if output:
         print(output)
@@ -264,7 +280,7 @@ class DeploymentTests(unittest.TestCase):
             'if [[ "$1 $2" == "service inspect" ]]; then printf "completed\\n"; '
             'elif [[ "$1 $2" == "service ps" ]]; then printf "task-1\\n"; '
             'elif [[ "$1" == inspect && "$*" == *"type task"* ]]; then printf "manager|running|container-1\\n"; '
-            f'elif [[ "$1" == inspect && "$*" == *"State.Health"* ]]; then sleep {delay}; printf "health-result:{health}\\n" >> "$PROBE_TRACE"; printf "{health}\\n"; '
+            f'elif [[ "$1" == inspect && "$*" == *"State.Health"* ]]; then sleep {delay}; printf "health-result:{health}\\n" >> "$PROBE_TRACE"; printf "running|{health}\\n"; '
             'else exit 90; fi\n',
             newline="\n",
         )
@@ -299,7 +315,7 @@ docker() {
         local health_probe=1
         command sleep "$PROBE_DELAY"
         printf 'health-result:%s\n' "$PROBE_HEALTH" >> "$PROBE_TRACE"
-        printf '%s\n' "$PROBE_HEALTH"
+        printf 'running|%s\n' "$PROBE_HEALTH"
     else
         return 90
     fi
@@ -426,6 +442,7 @@ exec "$TEST_PYTHON" "$TEST_DRIVER" fake-docker "$@"
         result = self.run_simulated_health_probe(delay=2, timeout=1)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("timeout", result.stderr.lower())
+        self.assertNotIn("healthy tasks", result.stdout)
         self.assertIn("State.Health", self.probe_trace.read_text())
         self.assertIn("health-result:healthy", self.probe_trace.read_text())
 
@@ -446,6 +463,81 @@ exec "$TEST_PYTHON" "$TEST_DRIVER" fake-docker "$@"
         self.assertIn("health-result:unhealthy", trace)
         self.assertIn("Health/convergence timeout", result.stderr)
         self.assertNotIn("healthy tasks", result.stdout)
+
+    def run_worker_wait(self, **scenario):
+        self.two_nodes()
+        self.state_path.write_text(json.dumps({"apps": True, "calls": [], **scenario}))
+        # Advance to the deadline after two unsuccessful polls, without a real sleep.
+        # 两轮检查均失败后推进至截止时间，无须实际休眠。
+        command = r'''
+set -eu
+export PATH="$TEST_BIN:$PATH" MANAGER_ID=manager WORKER_ID=worker DEPLOY_TIMEOUT=60
+source deploy/scripts/common.sh
+polls=0
+sleep() { polls=$((polls + 1)); if (( polls == 2 )); then SECONDS=$deadline; fi; }
+timeout() { printf '%s %s\n' "$3" "$4" >> "$PROBE_TRACE"; command timeout "$@"; }
+wait_healthy "${STACK}_worker" 2
+'''
+        self.probe_trace = self.directory / "probe-trace.log"
+        self.probe_trace.write_text("")
+        env = self.env | {"PROBE_TRACE": bash_path(self.probe_trace)}
+        return subprocess.run([BASH, "-c", command], env=env, cwd=ROOT, capture_output=True, text=True, timeout=20)
+
+    def test_ssh_reading_stdin_does_not_skip_the_second_healthy_task(self):
+        # SSH may consume its entire stdin before returning the first task's health.
+        # SSH 可能在返回首个任务的健康状态前读尽标准输入。
+        (self.bin / "ssh").write_text(
+            '#!/usr/bin/env bash\ncat >/dev/null\nexport FAKE_NODE=worker\nexec bash -c "${@: -1}"\n', newline="\n"
+        )
+        result = self.run_worker_wait(update="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("2 healthy tasks", result.stdout)
+        inspected = [
+            call["args"][-1] for call in self.state()["calls"]
+            if call["args"][:2] == ["inspect", "--format"]
+        ]
+        self.assertEqual(inspected, ["container-worker-1", "container-worker-2"])
+        probes = [line.split() for line in self.probe_trace.read_text().splitlines()]
+        self.assertEqual([command for _, command in probes].count("ssh"), 1)
+        self.assertTrue(all(0 < int(duration.removesuffix("s")) <= 10 for duration, _ in probes))
+
+    def test_transient_worker_queries_restart_the_health_check(self):
+        service = self.env["STACK"] + "_worker"
+        for query in (
+            ["service", "inspect", service], ["service", "ps", service],
+            ["inspect", "--type", "worker-2"], ["inspect", "--format", "container-worker-1"],
+        ):
+            with self.subTest(query=query):
+                result = self.run_worker_wait(fail_query=query)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("2 healthy tasks", result.stdout)
+                self.assertIn("unavailable", result.stderr)
+                state = self.state()
+                self.assertTrue(state["query_failed"])
+                self.assertEqual(sum(call["args"][:2] == ["service", "inspect"] for call in state["calls"]), 2)
+
+    def test_worker_timeout_reports_last_observation(self):
+        for scenario, reason in (
+            ({"fail_query": ["service", "ps", self.env["STACK"] + "_worker"], "permanent": True}, "task list unavailable"),
+            ({"fault": "unhealthy-worker"}, "unhealthy"),
+            ({"update": "updating"}, "update state is updating"),
+            ({"task_list": "worker-1"}, "1 desired tasks, expected 2"),
+            ({"task_list": "worker-1\nworker-1"}, "duplicate task ID"),
+        ):
+            with self.subTest(scenario=scenario):
+                result = self.run_worker_wait(**scenario)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Health/convergence timeout", result.stderr)
+                self.assertIn(reason, result.stderr)
+                self.assertNotIn("healthy tasks", result.stdout)
+
+    def test_failed_worker_update_stops_immediately(self):
+        for update in ("paused", "failed", "rollback_started", "rollback_completed"):
+            with self.subTest(update=update):
+                result = self.run_worker_wait(update=update)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"Update failed for offline-test_worker ({update})", result.stderr)
+                self.assertEqual(len(self.state()["calls"]), 1)
 
     def test_expired_deadline_does_not_start_a_probe(self):
         command = 'source "$COMMON_SH"; probe_before_deadline "$((SECONDS - 1))" true; status=$?; test "$status" -eq 124'
@@ -499,21 +591,24 @@ exec "$TEST_PYTHON" "$TEST_DRIVER" fake-docker "$@"
         self.assertEqual(len(self.state()["calls"]), 1)
 
     def test_success_stages_once_and_ignores_historical_success(self):
+        self.two_nodes()
         result = self.run_script(fault="existing-database")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         mutations = self.mutations()
         self.assertEqual(len(mutations), 4)
         self.assertEqual(mutations[0]["args"][:2], ["stack", "deploy"])
         self.assertEqual((mutations[0]["api"], mutations[0]["worker"]), ("0", "0"))
-        self.assertEqual(mutations[1]["args"][:2], ["service", "update"])
+        self.assertEqual(mutations[1]["args"], ["service", "update", "--detach=true", "--replicas", "1", "--force", "offline-test_setup"])
         self.assertIn("offline-test_setup=0", mutations[2]["args"])
         self.assertIn("offline-test_api=2", mutations[3]["args"])
         self.assertIn("offline-test_worker=2", mutations[3]["args"])
         self.assertFalse(self.state()["setup"])
         self.assertIn("exit code 0", result.stdout)
+        for service in ("api", "worker"):
+            self.assertIn(f"offline-test_{service}: 2 healthy tasks", result.stdout)
 
     def test_failed_setup_never_starts_applications_or_retries(self):
-        for fault in ("failed-setup", "nonzero-setup", "duplicate-setup", "timeout-setup"):
+        for fault in ("failed-setup", "nonzero-setup", "duplicate-setup", "timeout-setup", "historical-only"):
             with self.subTest(fault=fault):
                 self.state_path.write_text(json.dumps({"calls": []}))
                 result = self.run_script(fault=fault)
@@ -521,6 +616,22 @@ exec "$TEST_PYTHON" "$TEST_DRIVER" fake-docker "$@"
                 self.assertFalse(self.state().get("apps", False))
                 self.assertTrue(self.state()["setup"])
                 self.assertEqual(len(self.mutations()), 2)
+
+    def test_setup_requires_successful_replica_and_restart_policy_inspections(self):
+        for fault in ("failed-replica-inspection", "failed-restart-inspection", "retry-enabled"):
+            with self.subTest(fault=fault):
+                self.state_path.write_text(json.dumps({"calls": []}))
+                result = self.run_script(fault=fault)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.state().get("launched"))
+                self.assertFalse(self.state().get("apps"))
+
+    def test_second_setup_task_visible_at_scale_down_blocks_startup(self):
+        result = self.run_script(fault="late-duplicate")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Multiple new setup tasks", result.stderr)
+        self.assertFalse(self.state().get("apps"))
+        self.assertEqual(sum(call["args"][:2] == ["service", "update"] for call in self.mutations()), 1)
 
     def test_unhealthy_or_paused_database_never_runs_setup(self):
         for fault in ("unhealthy-db", "paused-db"):
@@ -547,6 +658,31 @@ exec "$TEST_PYTHON" "$TEST_DRIVER" fake-docker "$@"
         self.assertEqual(calls.count(["manifest", "inspect"]), 2)
         self.assertEqual(calls.count(["image", "inspect"]), 2)
         self.assertEqual(self.mutations(), [])
+
+    def test_existing_postgres_image_comparison(self):
+        self.two_nodes()
+        digest = "@sha256:837bed18782820fe967067cb5328b02b0d9992c1be9a37ee0c9c492cfc03af3b"
+        self.env["POSTGRES_IMAGE"] = "docker.io/library/postgres" + digest
+        for service_image, equivalent in (
+            ("postgres" + digest, True),
+            ("library/postgres" + digest, True),
+            ("docker.io/postgres" + digest, True),
+            ("index.docker.io/library/postgres:17" + digest, True),
+            ("postgres" + digest[:-1] + "a", False),
+            ("postgres:17", False),
+            ("docker.io/team/postgres" + digest, False),
+            ("registry.example/library/postgres" + digest, False),
+            ("docker.io/library/redis" + digest, False),
+        ):
+            with self.subTest(service_image=service_image):
+                self.state_path.write_text(json.dumps({"calls": [], "db_image": service_image}))
+                result = self.run_script(script="preflight.sh", mode="--check", fault="existing-database")
+                if equivalent:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("Existing database settings", result.stderr)
+                self.assertEqual(self.mutations(), [])
 
     def test_volume_registry_and_remote_identity_fail_closed(self):
         self.two_nodes()

@@ -16,7 +16,7 @@ The [technology stack guide](docs/TECH_STACK.md) explains the current tools, ver
 
 The API and worker share a Python 3.13 image. PostgreSQL 17 stores users, conversations, messages, jobs, demo orders and refund eligibility results on a persistent volume. Startup waits for database readiness, applies Alembic migrations, initializes the first account, then starts the API and worker.
 
-In fixed mode the worker handles the [simulated refund workflow](docs/WORKER_BASELINE.md#approve-or-reject-a-refund-proposal) and responds to ordinary messages with `Message received.`. Set `REPLY_MODE=openai` and configure a private API key to enable [agent tools and chat](docs/AGENT_EXECUTION.md) with bounded context, calls, time and retries. The browser receives [live updates over SSE](docs/LIVE_UPDATES.md). Backups and production Swarm deployment remain planned work. The included GitHub Actions workflow builds and tests the containers.
+In fixed mode the worker handles the [simulated refund workflow](docs/WORKER_BASELINE.md#approve-or-reject-a-refund-proposal) and responds to ordinary messages with `Message received.`. Set `REPLY_MODE=openai` and configure a private API key to enable text chat with bounded context, output and retries. The browser receives [live updates over SSE](docs/LIVE_UPDATES.md). The [cloud delivery guide](docs/CLOUD_DEPLOYMENT.md) covers reviewed Swarm releases, HTTPS and backup operations.
 
 ## Quick start
 
@@ -142,6 +142,28 @@ Generate a UUID with `[guid]::NewGuid()` in PowerShell or `python -c "import uui
 Both list endpoints default to 100 records and accept `limit` from 1 to 500. Requests for another account's resource return `404`; missing or invalid credentials return `401`; invalid input returns `422`; database unavailability returns `503`.
 
 System-generated defaults, validation errors, CLI prompts, logs and API descriptions are English. Source comments are bilingual. User-provided text remains Unicode and is stored as submitted.
+
+### Handle invalid input and request conflicts
+
+Conversation titles and message content containing a NUL character (`U+0000`) return `422` with the affected field in the validation detail. For a conflict when posting a message or deciding a proposal, the API returns `409` with an English `detail` and a stable `code`. For example, reusing a submission key with different text returns the following body.
+
+```json
+{
+  "detail": "submission_key already used for different content",
+  "code": "IDEMPOTENCY_CONFLICT"
+}
+```
+
+| Code | Condition |
+| --- | --- |
+| `IDEMPOTENCY_CONFLICT` | The submission key already belongs to a message with different content. |
+| `CONVERSATION_BUSY` | An active proposal or an earlier unfinished turn blocks the requested action. |
+| `PROPOSAL_EXPIRED` | The decision request found an expired proposal or an existing record of its expiration. |
+| `DECISION_CONFLICT` | A different decision is already saved for this proposal. |
+| `PROPOSAL_VERSION_CONFLICT` | The requested proposal version differs from the current version. |
+| `PROPOSAL_NOT_PENDING` | The proposal has left the approval stage and no expiration reason is available. |
+
+Retrying a submission with the same key and content returns its original receipt. Retrying the same proposal decision and version likewise returns the saved decision receipt. When a decision request closes an expired proposal, the API saves the invalidation and its events before returning `PROPOSAL_EXPIRED`.
 
 ### Read a saved refund result
 

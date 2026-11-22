@@ -208,7 +208,7 @@ function scheduleRefresh(delay = 150, attempt = 0) {
       scheduleRefresh(Math.min(1000 * 2 ** attempt, 10000), attempt + 1);
       return;
     }
-    listConversations().catch(() => {});
+    if (stream === current) listConversations().catch(() => {});
   }, delay);
 }
 
@@ -239,10 +239,10 @@ function stopStream() {
 /** Retire only the current unavailable chat, releasing its pending send immediately.
  * 只清理当前已不可用的会话，并立即释放其待确认提交。
  */
-function conversationUnavailable(current) {
-  if (stream !== current || conversation !== current.conversation || authorization !== current.authorization) return;
-  drafts.delete(conversation);
-  conversations = conversations.filter(row => row.id !== conversation);
+function conversationUnavailable(conversationId, credentials) {
+  if (conversation !== conversationId || authorization !== credentials) return;
+  drafts.delete(conversationId);
+  conversations = conversations.filter(row => row.id !== conversationId);
   awaitingReply = false;
   // The old submit's finally block is fenced out by resetChat's new generation.
   // resetChat 推进代次后，旧提交的 finally 不再执行，所以在此释放提交状态。
@@ -253,7 +253,7 @@ function conversationUnavailable(current) {
   const resetGeneration = generation;
   notice("This chat was removed or is no longer available.");
   listConversations().catch(error => {
-    if (generation === resetGeneration && authorization === current.authorization) notice(error.message);
+    if (generation === resetGeneration && authorization === credentials) notice(error.message);
   });
 }
 
@@ -294,10 +294,11 @@ async function runStream(current) {
         if (snapshot.status === 401) { authExpired(current); return; }
         if (snapshot.status === 404) {
           // Another tab can remove the chat between the history read and this snapshot. Retire it like
-          // a stream 404; the cleanup is fenced, so a late 404 cannot clear a chat opened since.
+          // a stream 404. Both the stream check and the cleanup's conversation and credential checks
+          // stop a late 404 from clearing a chat opened since.
           // 其他标签页可能在历史读取与本次快照之间删除会话。与事件流 404 一样清理；
-          // 清理函数带有归属检查，迟到的 404 不会清除之后打开的会话。
-          conversationUnavailable(current);
+          // 事件流检查以及清理函数的会话与凭据检查，可防止迟到的 404 清除之后打开的会话。
+          if (stream === current) conversationUnavailable(current.conversation, current.authorization);
           return;
         }
         if (!snapshot.ok) throw new Error("History snapshot unavailable");
@@ -317,7 +318,7 @@ async function runStream(current) {
       if (response.status === 404) {
         // Deletion can happen while disconnected, so a missed event has the same cleanup path.
         // 断线期间也可能删除会话，漏掉删除事件时使用相同的清理路径。
-        conversationUnavailable(current);
+        if (stream === current) conversationUnavailable(current.conversation, current.authorization);
         return;
       }
       if (!response.ok || !response.body) throw new Error("Live updates unavailable (" + response.status + ")");
@@ -395,9 +396,11 @@ function handleFrame(current, frame) {
     return true;
   }
   if (frame.event === "conversation.deleted" && data.conversation_id === current.conversation) {
-    // Share #9's cleanup: drafts, sidebar row, pending send and composer state.
-    // 复用 #9 的共享清理：草稿、侧栏条目、待确认提交与输入框状态。
-    conversationUnavailable(current);
+    // Share main's cleanup: drafts, sidebar row, pending send and composer state.
+    // The stream === current check at the top of this function fences obsolete streams.
+    // 复用 main 的共享清理：草稿、侧栏条目、待确认提交与输入框状态；
+    // 本函数开头的 stream === current 检查会屏蔽已失效的事件流。
+    conversationUnavailable(current.conversation, current.authorization);
     return true;
   }
   if (!/^v2:[0-9]+$/.test(frame.id) || data.conversation_id !== current.conversation ||
@@ -885,6 +888,7 @@ async function listConversations() {
 async function renderMessages(waiting = false) {
   const activeConversation = conversation;
   const activeGeneration = generation;
+  const credentials = authorization;
   const request = ++messageRead;
   if (!activeConversation) return;
 
@@ -892,7 +896,8 @@ async function renderMessages(waiting = false) {
    * 同时检查会话导航变化与同一会话内的并发读取，阻止旧响应覆盖新消息。
    */
   function isCurrent() {
-    return activeConversation === conversation && activeGeneration === generation && request === messageRead;
+    return activeConversation === conversation && activeGeneration === generation
+      && credentials === authorization && request === messageRead;
   }
 
   let rows = [], after = 0;
@@ -904,6 +909,10 @@ async function renderMessages(waiting = false) {
       // A superseded failure must not replace the notice or status of a newer successful send.
       // 已失效请求的错误不能覆盖后续成功发送的提示或状态，当前请求失败才继续抛出。
       if (!isCurrent()) return;
+      if (error.status === 404) {
+        conversationUnavailable(activeConversation, credentials);
+        return;
+      }
       throw error;
     }
     // Stop stale pagination immediately, including after sign-out or a newer history refresh.
