@@ -215,7 +215,7 @@ class CommandTests(unittest.TestCase):
                 self.assertEqual(backup.main(["--run"]), 1)
             self.assertNotIn("private response", output.getvalue())
 
-    def test_timer_retries_only_temporary_lock_contention(self):
+    def test_timer_retries_only_manager_busy(self):
         unit = ConfigParser(strict=False, interpolation=None)
         unit.read(UNITS / "agenthub-backup.service")
         service = unit["Service"]
@@ -262,6 +262,36 @@ class CommandTests(unittest.TestCase):
               self.assertRaisesRegex(backup.OperationFailed, "timed out")):
             backup_common.docker("exec", CONTAINER, "pg_restore")
 
+    def test_dormant_setup_checks_actual_state_of_every_listed_task(self):
+        ids = b"first\nsecond\nthird\nfourth\n"
+        for states, busy in (
+            (b"shutdown\ncomplete\nfailed\nrejected\n", False),
+            (b"shutdown\ncomplete\nrunning\nrejected\n", True),
+            (b"shutdown\ncomplete\npreparing\nrejected\n", True),
+            (b"shutdown\ncomplete\norphaned\nrejected\n", True),
+            (b"shutdown\ncomplete\nunknown\nrejected\n", True),
+        ):
+            with self.subTest(states=states), patch.object(backup, "docker", side_effect=[b"0\n", ids, states]) as docker:
+                if busy:
+                    with self.assertRaises(backup.ManagerBusy):
+                        backup.require_dormant_setup("test")
+                else:
+                    backup.require_dormant_setup("test")
+                self.assertEqual(docker.call_args_list, [
+                    call("service", "inspect", "--format", "{{.Spec.Mode.Replicated.Replicas}}", "test_setup"),
+                    call("service", "ps", "--no-trunc", "-q", "test_setup"),
+                    call("inspect", "--type", "task", "--format", "{{.Status.State}}", "first", "second", "third", "fourth"),
+                ])
+
+    def test_setup_inspection_errors_fail_without_requesting_retry(self):
+        error = backup.OperationFailed("Docker inspection failed")
+        for replies in ([error], [b"<nil>"], [b"0", error], [b"0", b"id", error],
+                        [b"0", b"first\nsecond", b"complete"]):
+            with self.subTest(replies=replies), patch.object(backup, "docker", side_effect=replies):
+                with self.assertRaises(backup.OperationFailed) as raised:
+                    backup.require_dormant_setup("test")
+                self.assertNotIsInstance(raised.exception, backup.ManagerBusy)
+
     def test_manager_lock_and_regional_spaces_client(self):
         modules = {name: Mock() for name in ("boto3", "botocore", "botocore.config", "fcntl")}
         fcntl = modules["fcntl"]
@@ -269,14 +299,21 @@ class CommandTests(unittest.TestCase):
         session = modules["boto3"].Session
         settings = {"STACK": "test", "SPACES_BUCKET": "private-bucket", "SPACES_REGION": "tor1"}
         with (patch.dict(sys.modules, modules), patch.dict(backup.os.environ, settings, clear=True),
-              patch("builtins.open", mock_open()) as lock, patch.object(backup, "daily_backup") as daily):
+              patch("builtins.open", mock_open()) as lock, patch.object(backup, "daily_backup") as daily,
+              patch.object(backup, "docker") as docker):
             fcntl.flock.side_effect = BlockingIOError()
-            with self.assertRaisesRegex(backup.OperationFailed, "manager lock"):
+            with self.assertRaisesRegex(backup.ManagerBusy, "manager lock"):
                 backup.run()
             lock.assert_called_with("/var/lock/agenthub-deploy.lock", "a")
-            session.assert_not_called()
-            daily.assert_not_called()
+            docker.assert_not_called()
             fcntl.flock.side_effect = None
+            for replies in ([b"1"], [b"0", b"id", b"running"]):
+                docker.side_effect = replies
+                with self.assertRaises(backup.ManagerBusy):
+                    backup.run()
+                session.assert_not_called()
+                daily.assert_not_called()
+            docker.side_effect = [b"0", b""]
             backup.run()
             session.assert_called_once_with(profile_name="agenthub-backup")
             client = session.return_value.client

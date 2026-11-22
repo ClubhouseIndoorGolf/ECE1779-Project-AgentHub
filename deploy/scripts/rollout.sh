@@ -50,7 +50,7 @@ rollout() {
     if [[ $action == deploy ]]; then
       [[ -z $initial || $image == "$initial" ]] || fail 'Current application digests differ'
       initial=$image
-      wait_healthy "$service" "$replicas" '' "$initial"
+      wait_healthy "$service" "$replicas" '' "$initial" baseline
     else
       [[ $image == "$candidate" || $image == "$previous_image" ]] || fail 'Service drift since deployment'
     fi

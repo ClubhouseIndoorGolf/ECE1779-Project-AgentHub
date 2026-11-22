@@ -211,6 +211,8 @@ rotation needs a separate coordinated procedure; changing names alone is unsafe.
 
 Under the shared lock, the manager verifies the existing stack, records the
 healthy baseline and runs one candidate setup task while the old apps serve.
+An API or worker service with a prior `rollback_completed` can pass baseline
+validation when all expected replicas are healthy and running the baseline digest.
 After a successful exit and scale-down of setup, it rolls API then worker, one
 replica at a time. Each gate checks the actual task digest and container health.
 The final monitor checks API/database connectivity and both nodes. Use the

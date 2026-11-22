@@ -19,8 +19,10 @@ python -m unittest discover -s deploy/tests -p test_cloud_operations.py -v
 
 ## Daily backup contract
 
-At **03:00 UTC**, the oneshot service takes the manager's deployment lock and
-locates the healthy local database task by its stack and service labels. The
+At **03:00 UTC**, the oneshot service takes the manager's deployment lock. Before
+accessing Spaces or the database, it verifies that setup has zero desired replicas
+and every setup task has reached `complete`, `shutdown`, `failed` or `rejected`.
+It then locates the healthy local database task by its stack and service labels. The
 task's PostgreSQL 17 `pg_dump` connects over loopback using its configured
 database, user and mounted `/run/secrets/db_password`. It writes a consistent
 custom-format archive. The dump covers one database, including its data and
@@ -103,7 +105,9 @@ systemctl show agenthub-backup.service -p Result -p ExecMainStatus
 A successful journal entry records the verified key and retained count. Check
 the latest successful date as well as the timer's next firing. Install the
 updated backup script and unit together. Each scheduled invocation retries
-only a busy manager lock, waiting 30 minutes between up to four attempts.
+when the manager lock is busy, setup is armed, or a setup task has yet to reach
+a recognized terminal state. It waits 30 minutes between up to four attempts.
+Docker inspection errors fail the invocation immediately.
 Exhaustion returns status 75. Manual `backup.py --run` makes one attempt.
 The oneshot unit allows 3h30min total, including the waits. On a missed day
 or nonzero service exit, check clock, lock contention, healthy database task,

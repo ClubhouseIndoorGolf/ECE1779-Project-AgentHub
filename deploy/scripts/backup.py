@@ -14,7 +14,27 @@ from backup_common import ARCHIVE_NAME, OperationFailed, archive_digest, docker
 
 
 class ManagerBusy(OperationFailed):
-    """Temporary contention with a deployment or another backup."""
+    """A deployment, setup task or another backup prevents this attempt."""
+
+
+def require_dormant_setup(stack):
+    service = f"{stack}_setup"
+    replicas = docker("service", "inspect", "--format", "{{.Spec.Mode.Replicated.Replicas}}", service).strip()
+    if not replicas.isdigit():
+        raise OperationFailed("Cannot determine setup replica count")
+    if int(replicas) > 0:
+        raise ManagerBusy("Setup service is still armed")
+
+    # Include task history because a scaled-down task may still be running.
+    # 检查全部历史任务，因为缩容后的任务仍可能正在运行。
+    tasks = docker("service", "ps", "--no-trunc", "-q", service).decode().splitlines()
+    if not tasks:
+        return
+    states = docker("inspect", "--type", "task", "--format", "{{.Status.State}}", *tasks).splitlines()
+    if len(states) != len(tasks):
+        raise OperationFailed("Incomplete setup task inspection")
+    if any(state not in (b"complete", b"shutdown", b"failed", b"rejected") for state in states):
+        raise ManagerBusy("Setup has a task without a confirmed terminal state")
 
 
 def dump_database(stack, archive):
@@ -123,6 +143,7 @@ def run():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ManagerBusy("Another backup or deployment holds the manager lock") from None
+        require_dormant_setup(stack)
         spaces = boto3.Session(profile_name="agenthub-backup").client(
             "s3", region_name="us-east-1", endpoint_url=f"https://{region}.digitaloceanspaces.com",
             config=Config(signature_version="s3v4", connect_timeout=5, read_timeout=60,
@@ -137,10 +158,10 @@ def run_with_lock_retries(attempts):
         try:
             run()
             return
-        except ManagerBusy:
+        except ManagerBusy as exc:
             if attempt == attempts:
                 raise
-            print(f"Manager lock busy on attempt {attempt}/{attempts}. Retrying in 30 minutes.", flush=True)
+            print(f"{exc} (attempt {attempt}/{attempts}). Retrying in 30 minutes.", flush=True)
             time.sleep(30 * 60)
 
 
@@ -149,7 +170,7 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--plan", action="store_true", help="Describe the job offline (default)")
     mode.add_argument("--run", action="store_true", help="Perform one backup and retention attempt")
-    mode.add_argument("--scheduled", action="store_true", help="Run the backup with bounded retries for a busy manager lock")
+    mode.add_argument("--scheduled", action="store_true", help="Retry a busy manager lock or unfinished setup")
     args = parser.parse_args(argv)
     if not (args.run or args.scheduled):
         print("Plan only. Dump PostgreSQL 17, upload privately, verify and retain seven UTC dates.")

@@ -45,12 +45,29 @@ docker() {
     *) exit 91 ;;
   esac
 }
-wait_healthy() {
-  [[ $1 == test_db || $(cat "$1") == "$4" ]]
-  if [[ $1 == test_api && ${4:-} == "$AGENTHUB_IMAGE" && ${FAULT:-} == timeout ]]; then
-    fail 'Simulated health timeout'
-  fi
+health_probe() {
+  local id=${!#}
+  case "$*" in
+    *UpdateStatus*)
+      if [[ $id == test_db ]]; then echo completed
+      elif [[ $(cat "$id") == "$AGENTHUB_IMAGE" ]]; then echo "${CANDIDATE_STATUS:-completed}"
+      else echo "${BASELINE_STATUS:-completed}"; fi ;;
+    *"service ps"*)
+      echo "$id.1"
+      if [[ $id != test_db && ${FAULT:-} != missing-replica ]]; then echo "$id.2"; fi ;;
+    *Status.ContainerStatus*) echo "manager|running|$id" ;;
+    *ContainerSpec.Image*)
+      if [[ $id == test_worker.2 && ${FAULT:-} == wrong-image ]]; then echo "$AGENTHUB_IMAGE"
+      else cat "${id%.*}"; fi ;;
+    *State.Health*)
+      if [[ $id == test_worker.2 && ${FAULT:-} == unhealthy ]] ||
+         [[ $id == test_api.1 && ${FAULT:-} == timeout && $(cat test_api) == "$AGENTHUB_IMAGE" ]]; then
+        echo 'running|unhealthy'
+      else echo 'running|healthy'; fi ;;
+    *) return 90 ;;
+  esac
 }
+sleep() { SECONDS=$deadline; }
 run_setup() { echo "setup $*" >> trace; [[ ${FAULT:-} != migration ]]; }
 python3() { echo monitor >> trace; [[ ${FAULT:-} != monitor ]]; }
 rollout "$ACTION" "$STATE_DIR/release"
@@ -72,7 +89,7 @@ class RolloutTests(unittest.TestCase):
         env = dict(os.environ, SCRIPT=bash_path(SCRIPTS), STATE_DIR=bash_path(self.directory),
                    IMAGE_REPOSITORY=REPOSITORY, AGENTHUB_IMAGE=image, ACTION=action, STACK="test",
                    API_REPLICAS="2", WORKER_REPLICAS="2", DB_NODE="manager", API_PUBLISHED_PORT="18000",
-                   SCRIPT_DIR=bash_path(SCRIPTS), **settings)
+                   SCRIPT_DIR=bash_path(SCRIPTS), MANAGER_ID="manager", DEPLOY_TIMEOUT="30", **settings)
         return subprocess.run([BASH, "-c", HARNESS], env=env, capture_output=True, text=True, timeout=15)
 
     def test_migration_then_ordered_rollout_and_approved_rollback(self):
@@ -112,6 +129,35 @@ class RolloutTests(unittest.TestCase):
         self.assertNotEqual(self.invoke("rollback", OLD).returncode, 0)
         self.assertEqual(self.trace.read_text().count("setup "), 1)
         self.assertNotIn("service update", self.trace.read_text())
+
+    def test_completed_rollback_allows_a_healthy_baseline(self):
+        result = self.invoke(BASELINE_STATUS="rollback_completed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.record.read_text().split(), ["deployed", OLD, NEW])
+
+    def test_completed_rollback_still_requires_all_healthy_replicas_on_the_baseline_digest(self):
+        for fault, diagnostic in (("unhealthy", "running|unhealthy"), ("wrong-image", "approved image"),
+                                  ("missing-replica", "1 desired tasks, expected 2")):
+            with self.subTest(fault=fault):
+                result = self.invoke(BASELINE_STATUS="rollback_completed", FAULT=fault)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stderr)
+                self.assertEqual(self.trace.read_text(), "")
+
+    def test_paused_failed_and_unfinished_baseline_updates_block_migration(self):
+        for status in ("paused", "failed", "rollback_started", "rollback_paused", "rollback_failed"):
+            with self.subTest(status=status):
+                result = self.invoke(BASELINE_STATUS=status)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"Update failed for test_api ({status})", result.stderr)
+                self.assertEqual(self.trace.read_text(), "")
+
+    def test_completed_rollback_fails_the_candidate_gate(self):
+        result = self.invoke(CANDIDATE_STATUS="rollback_completed")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Update failed for test_api (rollback_completed)", result.stderr)
+        self.assertEqual(self.record.read_text().split(), ["pending", OLD, NEW])
+        self.assertEqual((self.directory / "test_worker").read_text().strip(), OLD)
 
     def test_setup_requires_success_from_the_requested_image(self):
         script = r'''

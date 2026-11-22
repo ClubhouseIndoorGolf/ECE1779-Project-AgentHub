@@ -158,7 +158,7 @@ health_probe() {
 # Check one fresh snapshot. On retry, detail tells wait_healthy what was missing.
 # 每轮重新检查。需要重试时，通过 detail 告知 wait_healthy 尚未满足的条件。
 service_healthy() {
-  local service=$1 expected=$2 deadline=$3 required_node=$4
+  local service=$1 expected=$2 deadline=$3 required_node=$4 validation=${6:-}
   local update ids id record node state container health quoted observed_image
   local -a tasks=() inspect
   local -A seen=()
@@ -167,7 +167,9 @@ service_healthy() {
   update=$(health_probe "$deadline" docker service inspect --format '{{if .UpdateStatus}}{{.UpdateStatus.State}}{{end}}' "$service") || return 1
   case $update in
     ''|completed) ;;
-    failed|paused|rollback*) fail "Update failed for $service ($update); inspect task history privately" ;;
+    failed|paused|rollback*)
+      [[ $validation == baseline && $update == rollback_completed ]] ||
+        fail "Update failed for $service ($update); inspect task history privately" ;;
     *) detail="update state is $update"; return 1 ;;
   esac
 
@@ -213,7 +215,7 @@ wait_healthy() {
   local service=$1 expected=$2 deadline=$((SECONDS + DEPLOY_TIMEOUT)) remaining
   local detail='no observation completed' previous_detail=''
   while (( SECONDS < deadline )); do
-    if service_healthy "$service" "$expected" "$deadline" "${3:-}" "${4:-}"; then
+    if service_healthy "$service" "$expected" "$deadline" "${3:-}" "${4:-}" "${5:-}"; then
       (( SECONDS < deadline )) || { detail='healthy observations arrived too late'; break; }
       note "$service: $expected healthy tasks"
       return 0
