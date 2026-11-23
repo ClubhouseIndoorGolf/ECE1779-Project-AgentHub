@@ -193,6 +193,8 @@ function scheduleRefresh(delay = 150, attempt = 0) {
   refreshTimer = setTimeout(async () => {
     const current = stream;
     if (!current || current.conversation !== conversation) return;
+    // Reread open refund details on SSE updates so the dialog reflects approvals from another tab.
+    // 收到 SSE 更新时重新读取退款详情，让打开的弹窗反映其他标签页的审批结果。
     refreshExecutionDetail();
     try {
       await renderMessages(awaitingReply);
@@ -592,6 +594,8 @@ async function refreshExecutionDetail() {
   const request = ++detailRequest;
   try {
     const detail = await api("/executions/" + encodeURIComponent(executionDetailId));
+    // Only the latest request ID may update the open dialog, so late responses cannot restore stale details.
+    // 只接受编号仍为最新且弹窗仍打开的响应，防止迟到的旧详情覆盖最新状态。
     if (request !== detailRequest || !panel.open) return;
     const entries = [
       ["Order", detail.order_id],
