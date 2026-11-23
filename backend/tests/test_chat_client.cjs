@@ -602,6 +602,46 @@ test("a pushed job event completes a send without polling the job", async t => {
   assert.equal(client.element("connection-label").textContent, "Local workspace");
 });
 
+for (const detailsAvailable of [true, false]) {
+  test(`a pushed job failure ${detailsAvailable ? "shows the saved reason" : "falls back if the job read fails"}`, async t => {
+    let stream, jobReads = 0;
+    const reason = "Worker claim limit reached after interruption";
+    const client = createClient(async (url, options) => {
+      if (url === "/conversations/chat-a/events?version=2") {
+        stream = sseResponse(options.signal);
+        return stream.response;
+      }
+      if (url.endsWith("/messages") && options.method === "POST") return response({ job_id: "job-1" });
+      if (url.includes("/messages?")) return response([{ seq: 1, role: "user", content: "Hi" }]);
+      if (url === "/conversations") return response([]);
+      if (url === "/jobs/job-1") {
+        jobReads++;
+        return detailsAvailable
+          ? response({ id: "job-1", status: "FAILED", attempts: 3, last_error: reason })
+          : { ok: false, status: 503 };
+      }
+      throw new Error("Unexpected request: " + url);
+    }, streamingGlobals);
+    t.after(() => client.run("stopStream()"));
+    await client.run("authorization = 'Basic test'; openConversation({id:'chat-a', title:'A'})");
+    await until(() => stream);
+    stream.push('event: ready\ndata: {"cursor":"v2:0"}\n\n');
+    await until(() => client.run("streamLive()"));
+
+    const sending = client.send("Hi");
+    await until(() => client.run("jobWaiters.has('job-1')"));
+    stream.push('id: v2:1\nevent: job.status_changed\ndata: ' + JSON.stringify({
+      seq: "1", type: "job.status_changed", conversation_id: "chat-a",
+      payload: { job_id: "job-1", source_message_id: "m1", kind: "PROCESS_MESSAGE", status: "FAILED", attempts: 3 },
+    }) + '\n\n');
+    await sending;
+
+    assert.equal(client.element("notice").textContent, detailsAvailable ? reason : "The reply could not be completed.");
+    assert.equal(jobReads, 1);
+    assert.equal(client.run("busy"), false);
+  });
+}
+
 test("a dropped stream reconnects with the last complete durable event ID", async t => {
   const attempts = [];
   const client = createClient(async (url, options) => {
@@ -1100,4 +1140,54 @@ test("a saved execution opens from history and displays only an applied refund a
   applied = true;
   await click();
   assert.ok(values().includes("CAD 90071992547409.93"));
+});
+
+test("an open refund dialog updates on SSE and ignores an older in-flight refresh", async t => {
+  let stream, resolveQueued, detailReads = 0, historyReads = 0;
+  let detail = { outcome: "ELIGIBLE", order_id: "1001", reason_codes: [], status: "WAITING_FOR_APPROVAL", result: null };
+  const client = createClient(async (url, options) => {
+    if (url === "/conversations/chat-a/events?version=2") {
+      stream = sseResponse(options.signal);
+      return stream.response;
+    }
+    if (url.includes("/messages?")) {
+      historyReads++;
+      return response([{ seq: 1, role: "user", content: "Refund", execution_id: "ex-1" }]);
+    }
+    if (url === "/conversations") return response([]);
+    if (url === "/executions/ex-1") {
+      const snapshot = response(detail);
+      if (++detailReads === 2) return new Promise(resolve => { resolveQueued = () => resolve(snapshot); });
+      return snapshot;
+    }
+    throw new Error("Unexpected request: " + url);
+  }, streamingGlobals);
+  t.after(() => client.run("stopStream()"));
+  await client.run("authorization = 'Basic test'; openConversation({id:'chat-a', title:'A'})");
+  await until(() => stream);
+  stream.push('event: ready\ndata: {"cursor":"v2:0"}\n\n');
+  await until(() => historyReads === 2);
+  await client.element("messages").children[0].children[2].listeners.get("click")();
+  const values = () => client.element("execution-fields").children.map(el => el.textContent);
+  assert.ok(values().includes("WAITING_FOR_APPROVAL"));
+
+  function push(seq, type) {
+    stream.push(`id: v2:${seq}\nevent: ${type}\ndata: ` + JSON.stringify({
+      seq: String(seq), type, conversation_id: "chat-a", payload: { proposal_id: "p1", execution_id: "ex-1" },
+    }) + '\n\n');
+  }
+  detail = { ...detail, status: "QUEUED", decision: { decision: "APPROVE" }, resume_job_status: "QUEUED" };
+  push(1, "proposal.decided");
+  await until(() => resolveQueued);
+  detail = { ...detail, status: "COMPLETED", resume_job_status: "SUCCEEDED",
+    result: { refund_amount_minor: "12999", currency: "CAD" } };
+  push(2, "resolution.completed");
+  await until(() => values().includes("CAD 129.99"));
+  resolveQueued();
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(client.element("execution-panel").open, true);
+  assert.deepEqual(values(), ["Order", "1001", "Eligibility", "ELIGIBLE", "Workflow status", "COMPLETED",
+    "Decision", "APPROVE", "Continuation", "SUCCEEDED", "Refund applied", "CAD 129.99"]);
+  assert.equal(detailReads, 3);
 });
