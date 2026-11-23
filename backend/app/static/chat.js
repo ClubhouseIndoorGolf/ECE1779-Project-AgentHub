@@ -193,6 +193,9 @@ function scheduleRefresh(delay = 150, attempt = 0) {
   refreshTimer = setTimeout(async () => {
     const current = stream;
     if (!current || current.conversation !== conversation) return;
+    // Reread open refund details on SSE updates so the dialog reflects approvals from another tab.
+    // 收到 SSE 更新时重新读取退款详情，让打开的弹窗反映其他标签页的审批结果。
+    refreshExecutionDetail();
     try {
       await renderMessages(awaitingReply);
     } catch (error) {
@@ -581,23 +584,36 @@ function invalidationMessage(code) {
   return code && Object.hasOwn(INVALIDATION_MESSAGES, code) ? INVALIDATION_MESSAGES[code] : GENERIC_INVALIDATION;
 }
 
+let executionDetailId = null;
 let detailRequest = 0;
 
 function closeExecutionDetail() {
+  executionDetailId = null;
   detailRequest++;
   if ($("execution-panel").open) $("execution-panel").close();
   $("execution-fields").replaceChildren();
 }
 
-async function openExecutionDetail(id) {
-  const request = ++detailRequest;
+function openExecutionDetail(id) {
+  executionDetailId = id;
   const panel = $("execution-panel");
-  const fields = $("execution-fields");
-  fields.replaceChildren();
+  $("execution-fields").replaceChildren();
   $("execution-status").textContent = "Loading…";
   if (!panel.open) panel.showModal();
+  return refreshExecutionDetail();
+}
+
+/** Refresh the selected execution without clearing the visible fields while it loads.
+ * 刷新当前查看的执行记录，加载期间保留已显示的详情。
+ */
+async function refreshExecutionDetail() {
+  const panel = $("execution-panel");
+  if (!panel.open || executionDetailId === null) return;
+  const request = ++detailRequest;
   try {
-    const detail = await api("/executions/" + encodeURIComponent(id));
+    const detail = await api("/executions/" + encodeURIComponent(executionDetailId));
+    // Only the latest request ID may update the open dialog, so late responses cannot restore stale details.
+    // 只接受编号仍为最新且弹窗仍打开的响应，防止迟到的旧详情覆盖最新状态。
     if (request !== detailRequest || !panel.open) return;
     const entries = [
       ["Order", detail.order_id],
@@ -619,14 +635,16 @@ async function openExecutionDetail(id) {
     // 金额取自 result，而不是方案中的金额。
     if (detail.result) entries.push(["Refund applied",
       formatRefund(detail.result.refund_amount_minor, detail.result.currency)]);
+    const fields = [];
     for (const [name, value] of entries) {
       if (!value) continue;
       const term = document.createElement("dt");
       const description = document.createElement("dd");
       term.textContent = name;
       description.textContent = value;
-      fields.append(term, description);
+      fields.push(term, description);
     }
+    $("execution-fields").replaceChildren(...fields);
     $("execution-status").textContent = "";
   } catch (error) {
     if (request === detailRequest && panel.open) $("execution-status").textContent = error.message;
@@ -1225,8 +1243,18 @@ $("message-form").addEventListener("submit", async event => {
         awaitingReply = false;
         pending = null;
         status("Failed");
+        const credentials = authorization;
         await renderMessages();
-        throw new Error(job.last_error || "The reply could not be completed.");
+        if (generation !== currentGeneration || credentials !== authorization) return;
+        let reason = job.last_error;
+        // Durable events carry job status. Read the saved reason from the job endpoint on failure.
+        // 持久化事件携带任务状态。任务失败时，从任务接口读取已保存的原因。
+        if (reason === undefined) {
+          const failedJob = await api("/jobs/" + receipt.job_id).catch(() => null);
+          reason = failedJob?.last_error;
+        }
+        if (credentials !== authorization) return;
+        throw new Error(reason || "The reply could not be completed.");
       }
       if (job.status === "SUCCEEDED") {
         awaitingReply = false;
